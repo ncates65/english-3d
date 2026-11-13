@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      try {
+        var storedScheme = localStorage.getItem('color-scheme');
+        var metaScheme = document.querySelector('meta[name="color-scheme"]');
+        if (storedScheme === 'light' || storedScheme === 'dark') {
+          if (metaScheme) metaScheme.content = storedScheme;
+          document.documentElement.classList.toggle('dark', storedScheme === 'dark');
+        } else {
+          var sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          document.documentElement.classList.toggle('dark', sysDark);
+        }
+      } catch (e) {}
+    </script>
+    <title>Practice Buddy — Evidence-Based Active Recall &amp; Feynman Studio</title>
+    <meta
+      name="description"
+      content="Practice Buddy transforms study topics, PDFs, slides, and links into Cepeda-optimal spaced retrieval schedules synced to Google Calendar &amp; Tasks with AI-graded active recall."
+    />
+    <link rel="icon" type="image/png" href="/study/logo.png" />
+    <link rel="apple-touch-icon" href="/study/logo.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <!-- Google Identity Services for OAuth2 Calendar & Tasks Sync -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased selection:bg-emerald-500/25 selection:text-emerald-900 dark:selection:text-emerald-200 transition-colors duration-150">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

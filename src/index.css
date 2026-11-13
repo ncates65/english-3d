@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/* Support both class-based (.dark) and meta[name="color-scheme"]-driven dark mode */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  /* Primary & Secondary Brand Color Tokens (Emerald & Sky — zero purple/indigo) */
+  --brand-primary-light: #059669;
+  --brand-primary-dark: #34d399;
+  --brand-secondary-light: #0284c7;
+  --brand-secondary-dark: #38bdf8;
+  --surface-canvas-light: #f8fafc;
+  --surface-canvas-dark: #090d16;
+
+  --accent-color: var(--brand-primary-light);
+  --surface-canvas: var(--surface-canvas-light);
+
+  /* Fallback for browsers without light-dark() support */
+  @media (prefers-color-scheme: dark) {
+    --accent-color: var(--brand-primary-dark);
+    --surface-canvas: var(--surface-canvas-dark);
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --accent-color: light-dark(var(--brand-primary-light), var(--brand-primary-dark));
+    --surface-canvas: light-dark(var(--surface-canvas-light), var(--surface-canvas-dark));
+  }
+
+  /* Automatically adapt native browser UI (scrollbars, form controls, date/time pickers) */
+  color-scheme: light dark;
+  accent-color: var(--accent-color);
+
+  &:has(> head > meta[name="color-scheme"][content="dark"]) {
+    color-scheme: dark;
+  }
+
+  &:has(> head > meta[name="color-scheme"][content="light"]) {
+    color-scheme: light;
+  }
+}
+
+@layer base {
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: var(--surface-canvas);
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+}
+
+/* Modern Web Guidance: Prevent underlying page scroll chaining on modal <dialog> */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background-color: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(6px);
+}
