@@ -21,7 +21,7 @@ define('DB_CHARSET', 'utf8mb4');
 
 // Gemini API Configuration
 // Note: gemini-2.5-flash is legacy/deprecated; upgraded to gemini-3.8-flash per current Google GenAI spec
-define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: 'AQ.Ab8RN6LsP4GNb4K-THHjawacFQ7UlmusJdIPGNA5sCT9SX_OLQ');
+define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: 'f646f6a72a1cd51e7bf8b76165d83479bff1b546');
 define('GEMINI_MODEL', getenv('GEMINI_MODEL') ?: 'gemini-3.8-flash');
 define('GEMINI_INTERACTIONS_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/interactions');
 define('GEMINI_API_REVISION', '2026-05-20');
