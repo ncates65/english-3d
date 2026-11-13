@@ -16,12 +16,12 @@ define('APP_BASE_URL', getenv('APP_BASE_URL') ?: 'https://english-3D.com/study')
 define('DB_HOST', getenv('DB_HOST') ?: 'localhost');
 define('DB_NAME', getenv('DB_NAME') ?: 'u237966338_spaced_study');
 define('DB_USER', getenv('DB_USER') ?: 'u237966338_study_admin');
-define('DB_PASS', getenv('DB_PASS') ?: 'rYK2Jr9_GZpgD@7j*euHevZP');
+define('DB_PASS', getenv('DB_PASS') ?: 'PASSWORD_HERE');
 define('DB_CHARSET', 'utf8mb4');
 
 // Gemini API Configuration
 // Note: gemini-2.5-flash is legacy/deprecated; upgraded to gemini-3.8-flash per current Google GenAI spec
-define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: 'AQ.Ab8RN6LsP4GNb4K-THHjawacFQ7UlmusJdIPGNA5sCT9SX_OLQ');
+define('GEMINI_API_KEY', getenv('GEMINI_API_KEY') ?: 'GEMIN_API_KEY_HERE');
 define('GEMINI_MODEL', getenv('GEMINI_MODEL') ?: 'gemini-3.8-flash');
 define('GEMINI_INTERACTIONS_ENDPOINT', 'https://generativelanguage.googleapis.com/v1beta/interactions');
 define('GEMINI_API_REVISION', '2026-05-20');
