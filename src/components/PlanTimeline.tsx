@@ -18,7 +18,7 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react';
-import { StudyPlan, StudySession } from '../types/study';
+import { SessionPromptItem, StudyPlan, StudySession } from '../types/study';
 import {
   STAGE_GUIDANCE_CONFIG,
   calculateSpacedSchedule,
@@ -63,10 +63,12 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
     plan.masterByDate
   );
 
-  const completedCount = plan.sessions.filter(
+  const activeSessions = plan.sessions.filter((s) => s.status !== 'merged');
+  const mergedSessions = plan.sessions.filter((s) => s.status === 'merged');
+  const completedCount = activeSessions.filter(
     (s) => s.status === 'completed'
   ).length;
-  const scoredSessions = plan.sessions.filter(
+  const scoredSessions = activeSessions.filter(
     (s) => typeof s.masteryScore === 'number'
   );
   const avgMastery =
@@ -157,8 +159,17 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
                 {plan.startDate} → {plan.masterByDate}
               </span>
               <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-3 py-0.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300">
-                {completedCount}/{plan.sessions.length} Completed
+                {completedCount}/{activeSessions.length} Completed
               </span>
+              {plan.studyMode === 'spiral_chunking' ? (
+                <span className="rounded-full bg-teal-500/15 border border-teal-500/30 px-3 py-0.5 text-xs font-semibold text-teal-800 dark:text-teal-200">
+                  Spiral Chunking • {plan.targetChunkCount || 2} Modules
+                </span>
+              ) : (
+                <span className="rounded-full bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-0.5 text-xs font-medium text-slate-700 dark:text-slate-300">
+                  Deepening Mode
+                </span>
+              )}
               {avgMastery !== null && (
                 <span className="rounded-full bg-amber-500/15 border border-amber-500/30 px-3 py-0.5 text-xs font-semibold text-amber-700 dark:text-amber-300">
                   Avg Mastery: {avgMastery}%
@@ -393,8 +404,12 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
         </div>
 
         <div className="space-y-4">
-          {plan.sessions.map((session) => {
+          {activeSessions.map((session) => {
             const isCompleted = session.status === 'completed';
+            const isAdjusted = Boolean(
+              session.originalScheduledDate &&
+                session.scheduledDate !== session.originalScheduledDate
+            );
             const deepLink = buildSessionDeepLink(plan.id, session.id);
             const gcalTemplateUrl = buildGoogleCalendarTemplateUrl(
               plan,
@@ -428,6 +443,11 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
                       {session.gapDays > 0 && (
                         <span className="rounded-lg bg-sky-500/10 border border-sky-500/30 px-2 py-0.5 font-mono text-xs text-sky-700 dark:text-sky-300">
                           +{session.gapDays}d Expanding Gap
+                        </span>
+                      )}
+                      {isAdjusted && (
+                        <span className="rounded-full bg-teal-100 dark:bg-teal-950/60 border border-teal-300/60 dark:border-teal-800 px-2.5 py-0.5 text-[11px] font-medium text-teal-800 dark:text-teal-200">
+                          Adjusted to keep you on track
                         </span>
                       )}
                       {isCompleted ? (
@@ -513,20 +533,52 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
                     </span>
                   </div>
                   <ul className="space-y-1.5 text-xs text-slate-700 dark:text-slate-200">
-                    {session.prompts.map((prompt, pIdx) => (
-                      <li key={pIdx} className="flex items-start gap-2">
-                        <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">
-                          Q{pIdx + 1}.
-                        </span>
-                        <span>{prompt}</span>
-                      </li>
-                    ))}
+                    {(session.promptItems && session.promptItems.length > 0
+                      ? session.promptItems
+                      : session.prompts.map(
+                          (p): SessionPromptItem => ({
+                            prompt_text: p,
+                            expected_rubric_points: [],
+                          })
+                        )
+                    ).map((item, pIdx) => {
+                      const tag = item.chunk_tag || '';
+                      const tagClass = tag.startsWith('New:')
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : tag.startsWith('Review:')
+                          ? 'bg-sky-100 text-sky-800 dark:bg-sky-950/60 dark:text-sky-300'
+                          : 'bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300';
+                      return (
+                        <li key={pIdx} className="flex items-start gap-2">
+                          <span className="font-mono text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">
+                            Q{pIdx + 1}.
+                          </span>
+                          <div className="flex-1 flex flex-wrap items-baseline gap-1.5">
+                            {tag && (
+                              <span
+                                className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold ${tagClass}`}
+                              >
+                                {tag}
+                              </span>
+                            )}
+                            <span>{item.prompt_text}</span>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               </div>
             );
           })}
         </div>
+
+        {mergedSessions.length > 0 && (
+          <p className="text-[11px] text-slate-500 dark:text-slate-400 italic">
+            Note: {mergedSessions.length} intermediate review session
+            {mergedSessions.length === 1 ? '' : 's'} merged into active upcoming blocks during schedule compression to protect your core deadlines.
+          </p>
+        )}
       </div>
     </div>
   );

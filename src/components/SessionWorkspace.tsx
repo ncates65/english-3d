@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import {
   GradeRecallEvaluation,
+  SessionPromptItem,
   StudyPlan,
   StudySession,
   UserAccount,
@@ -43,7 +44,11 @@ interface SessionWorkspaceProps {
   session: StudySession;
   currentUser?: UserAccount | null;
   onBackToTimeline: () => void;
-  onPlanUpdated: (updatedPlan: StudyPlan, nextSession?: StudySession) => void;
+  onPlanUpdated: (
+    updatedPlan: StudyPlan,
+    nextSession?: StudySession,
+    recalibrated?: boolean
+  ) => void;
 }
 
 // TypeScript interface for Web Speech API (SpeechRecognition / webkitSpeechRecognition)
@@ -219,7 +224,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
 
     setIsGrading(true);
     try {
-      const { evaluation: resultEval, updatedPlan } =
+      const { evaluation: resultEval, updatedPlan, recalibrated } =
         await submitRecallForGrading({
           plan,
           session,
@@ -233,7 +238,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
       const refreshedSession = updatedPlan.sessions.find(
         (s) => s.id === session.id
       );
-      onPlanUpdated(updatedPlan, refreshedSession);
+      onPlanUpdated(updatedPlan, refreshedSession, recalibrated);
     } finally {
       setIsGrading(false);
     }
@@ -350,18 +355,55 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
               <span>{stageMeta.guidanceBanner}</span>
             </div>
 
+            {/* Continuity Hook bridging previous session */}
+            {session.continuityHook && session.continuityHook.trim() !== '' && (
+              <div className="rounded-xl border border-sky-500/30 bg-sky-50/70 dark:bg-sky-950/20 px-4 py-2.5 text-xs text-sky-900 dark:text-sky-100 leading-relaxed">
+                <span className="font-bold uppercase tracking-wider text-sky-700 dark:text-sky-300 mr-1.5">
+                  Continuity Thread:
+                </span>
+                <span>{session.continuityHook}</span>
+              </div>
+            )}
+
             <ol className="space-y-3">
-              {session.prompts.map((prompt, idx) => (
-                <li
-                  key={idx}
-                  className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/80 p-4 text-sm text-slate-800 dark:text-slate-100 leading-relaxed flex items-start gap-3"
-                >
-                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-emerald-500/20 font-mono text-xs font-bold text-emerald-700 dark:text-emerald-300">
-                    {idx + 1}
-                  </span>
-                  <span>{prompt}</span>
-                </li>
-              ))}
+              {(session.promptItems && session.promptItems.length > 0
+                ? session.promptItems
+                : session.prompts.map(
+                    (p): SessionPromptItem => ({
+                      prompt_text: p,
+                      expected_rubric_points: [],
+                    })
+                  )
+              ).map((item, idx) => {
+                const tag = item.chunk_tag || '';
+                const tagClass = tag.startsWith('New:')
+                  ? 'bg-emerald-100 text-emerald-800 border-emerald-300/60 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800'
+                  : tag.startsWith('Review:')
+                    ? 'bg-sky-100 text-sky-800 border-sky-300/60 dark:bg-sky-950/60 dark:text-sky-300 dark:border-sky-800'
+                    : 'bg-slate-200 text-slate-700 border-slate-300/60 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700';
+                return (
+                  <li
+                    key={idx}
+                    className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/80 p-4 text-sm text-slate-800 dark:text-slate-100 leading-relaxed flex items-start gap-3"
+                  >
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-emerald-500/20 font-mono text-xs font-bold text-emerald-700 dark:text-emerald-300">
+                      {idx + 1}
+                    </span>
+                    <div className="flex-1 space-y-1.5">
+                      {tag && (
+                        <div>
+                          <span
+                            className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${tagClass}`}
+                          >
+                            {tag}
+                          </span>
+                        </div>
+                      )}
+                      <div>{item.prompt_text}</div>
+                    </div>
+                  </li>
+                );
+              })}
             </ol>
 
             {/* Interactive Recall Input + Web Speech API Dictation */}

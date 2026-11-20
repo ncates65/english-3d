@@ -1,5 +1,7 @@
 import {
   GradeRecallEvaluation,
+  RecalibrationResolutionMode,
+  RecalibrationTier,
   ScheduledSessionBlueprint,
   SessionPromptItem,
   StudyPlan,
@@ -10,12 +12,16 @@ import {
 } from '../types/study';
 import {
   addCalendarDays,
+  assignSpiralChunkScopes,
+  buildStageSkeleton,
   calculateSpacedSchedule,
   CognitiveStageNumber,
+  computeExpandingOffsets,
   diffCalendarDays,
   formatLocalDate,
   normalizeStageName,
   resolveStageNumber,
+  selectStudyMode,
 } from '../utils/spacingEngine';
 import { requestGoogleOAuthToken } from '../utils/calendarSync';
 
@@ -144,24 +150,34 @@ function markSeedInitialized(scopeKey: string): void {
 function normalizePlanData(plan: StudyPlan): StudyPlan {
   return {
     ...plan,
+    studyMode: plan.studyMode === 'spiral_chunking' ? 'spiral_chunking' : 'deepening',
+    targetChunkCount: plan.targetChunkCount || 1,
+    studyWindowMinutes: plan.studyWindowMinutes || plan.studyWindow?.durationMinutes || 30,
     sessions: (plan.sessions || []).map((s, idx) => {
       const stageName = normalizeStageName(s.stageName || '');
       const stageNumber = resolveStageNumber({
         stageNumber: s.stageNumber,
+        stageKey: s.stageKey,
         stageName,
         sessionNumber: s.sessionNumber || idx + 1,
       });
       const promptItems: SessionPromptItem[] =
         Array.isArray(s.promptItems) && s.promptItems.length > 0
-          ? s.promptItems
+          ? s.promptItems.map((pi) => ({
+              prompt_text: pi.prompt_text,
+              expected_rubric_points: pi.expected_rubric_points || [],
+              ...(pi.chunk_tag ? { chunk_tag: pi.chunk_tag } : {}),
+            }))
           : (s.prompts || []).map((p) => ({
-            prompt_text: p,
-            expected_rubric_points: [],
-          }));
+              prompt_text: p,
+              expected_rubric_points: [],
+            }));
       return {
         ...s,
         stageNumber,
         stageName,
+        originalScheduledDate: s.originalScheduledDate || s.scheduledDate,
+        recalibrationCount: typeof s.recalibrationCount === 'number' ? s.recalibrationCount : 0,
         promptItems,
         prompts: promptItems.map((pi) => pi.prompt_text),
       };
@@ -848,8 +864,12 @@ async function persistPlanDirectToMySql(
         userEmail: user?.email || plan.userEmail || 'learner@english-3d.com',
         guestToken: getOrCreateLocalGuestToken(),
         topicTitle: plan.topicTitle,
+        studyMode: plan.studyMode || 'deepening',
+        targetChunkCount: plan.targetChunkCount || 1,
+        studyWindowMinutes: plan.studyWindowMinutes || plan.studyWindow?.durationMinutes || 30,
         executiveSummary: plan.executiveSummary,
         coreConcepts: plan.coreConcepts,
+        blueprint: plan.blueprint || null,
         sourceLinks: plan.sourceLinks,
         extractedContextCache: plan.extractedContextCache,
         startDate: plan.startDate,
@@ -1006,6 +1026,7 @@ export async function generateAndSaveStudyPlan(params: {
         files: params.files,
         startDate: params.startDate,
         masterByDate: params.masterByDate,
+        studyWindowMinutes: params.studyWindow.durationMinutes,
         scheduledBlueprints: params.scheduledBlueprints,
         userEmail: activeUser?.email || params.userEmail || 'learner@english-3d.com',
         guestToken: getOrCreateLocalGuestToken(),
@@ -1063,14 +1084,333 @@ export async function generateAndSaveStudyPlan(params: {
   return { plan: candidatePlan, persistedInMySql, warning };
 }
 
+function mergeUniquePromptItemsLocal(
+  target: SessionPromptItem[],
+  source: SessionPromptItem[]
+): SessionPromptItem[] {
+  const merged: SessionPromptItem[] = [];
+  const seen = new Set<string>();
+  for (const item of [...target, ...source]) {
+    const t = item.prompt_text.trim();
+    if (!t) continue;
+    const norm = t.toLowerCase();
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function mergeUniqueChecklistLocal(target: string[], source: string[]): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...target, ...source]) {
+    const t = item.trim();
+    if (!t) continue;
+    const norm = t.toLowerCase();
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    merged.push(t);
+  }
+  return merged;
+}
+
+function applyLocalThreeTierRecalibration(
+  plan: StudyPlan,
+  anchorDate: string,
+  resolutionMode: RecalibrationResolutionMode | 'tier1_only'
+): {
+  updatedPlan: StudyPlan;
+  shiftedCount: number;
+  mergedCount: number;
+  tier: RecalibrationTier;
+  recalibrated: boolean;
+  options?: string[];
+} {
+  const sorted = [...plan.sessions].sort(
+    (a, b) => a.sessionNumber - b.sessionNumber || a.id - b.id
+  );
+  const pendingRows = sorted.filter((s) => s.status === 'pending');
+  if (pendingRows.length === 0) {
+    return {
+      updatedPlan: plan,
+      shiftedCount: 0,
+      mergedCount: 0,
+      tier: 'no_pending_sessions',
+      recalibrated: false,
+    };
+  }
+
+  const completedRows = sorted.filter((s) => s.status === 'completed');
+  const lastCompletedDate =
+    completedRows.length > 0
+      ? completedRows[completedRows.length - 1].scheduledDate
+      : null;
+
+  let workingMasterBy = plan.masterByDate;
+  let remainingDays = diffCalendarDays(anchorDate, workingMasterBy);
+  let extendApplied = false;
+
+  if (remainingDays <= 0) {
+    if (resolutionMode === 'tier1_only') {
+      return {
+        updatedPlan: plan,
+        shiftedCount: 0,
+        mergedCount: 0,
+        tier: 'no_pending_sessions',
+        recalibrated: false,
+      };
+    }
+    if (resolutionMode === 'auto') {
+      return {
+        updatedPlan: plan,
+        shiftedCount: 0,
+        mergedCount: 0,
+        tier: 'deadline_squeeze',
+        recalibrated: false,
+        options: ['extend_7_days', 'final_sprint_today'],
+      };
+    }
+    if (resolutionMode === 'extend_7_days') {
+      const baseEnd = workingMasterBy > anchorDate ? workingMasterBy : anchorDate;
+      workingMasterBy = addCalendarDays(baseEnd, 7);
+      remainingDays = diffCalendarDays(anchorDate, workingMasterBy);
+      extendApplied = true;
+    } else if (resolutionMode === 'final_sprint_today') {
+      const lastPending = pendingRows[pendingRows.length - 1];
+      let combinedPrompts = [...(lastPending.promptItems || [])];
+      let combinedChecklist = [...(lastPending.verificationChecklist || [])];
+      const mergedIds = new Set<number>();
+
+      for (let i = 0; i < pendingRows.length - 1; i++) {
+        const src = pendingRows[i];
+        mergedIds.add(src.id);
+        combinedPrompts = mergeUniquePromptItemsLocal(
+          src.promptItems ||
+            src.prompts.map((p) => ({ prompt_text: p, expected_rubric_points: [] })),
+          combinedPrompts
+        );
+        combinedChecklist = mergeUniqueChecklistLocal(
+          src.verificationChecklist || [],
+          combinedChecklist
+        );
+      }
+
+      const dayOffset = Math.max(0, diffCalendarDays(plan.startDate, anchorDate));
+      const gapDays = lastCompletedDate
+        ? Math.max(0, diffCalendarDays(lastCompletedDate, anchorDate))
+        : 0;
+
+      const updatedSessions = plan.sessions.map((s) => {
+        if (s.status !== 'pending') return s;
+        if (mergedIds.has(s.id)) {
+          return {
+            ...s,
+            status: 'merged' as const,
+            mergedIntoSessionId: lastPending.id,
+            recalibrationCount: (s.recalibrationCount || 0) + 1,
+          };
+        }
+        if (s.id === lastPending.id) {
+          return {
+            ...s,
+            stageNumber: 5,
+            stageKey: 'mastery_verification',
+            stageName: 'Stage 5: Mastery Verification (Final Sprint)',
+            scheduledDate: anchorDate,
+            originalScheduledDate: s.originalScheduledDate || s.scheduledDate,
+            dayOffset,
+            gapDays,
+            promptItems: combinedPrompts,
+            prompts: combinedPrompts.map((pi) => pi.prompt_text),
+            verificationChecklist: combinedChecklist,
+            recalibrationCount: (s.recalibrationCount || 0) + 1,
+          };
+        }
+        return s;
+      });
+
+      const finalPlan = normalizePlanData({
+        ...plan,
+        masterByDate: workingMasterBy < anchorDate ? anchorDate : workingMasterBy,
+        sessions: updatedSessions,
+      });
+
+      return {
+        updatedPlan: finalPlan,
+        shiftedCount: 1,
+        mergedCount: mergedIds.size,
+        tier: 'tier3_final_sprint',
+        recalibrated: true,
+      };
+    }
+  }
+
+  // Tier 1: Runway >= pendingRows.length
+  if (remainingDays >= pendingRows.length) {
+    const maxSpan = Math.max(pendingRows.length - 1, remainingDays - 1);
+    const offsets = computeExpandingOffsets(pendingRows.length, maxSpan);
+    const updatesById = new Map<number, StudySession>();
+    let prevDate = lastCompletedDate;
+
+    pendingRows.forEach((s, idx) => {
+      const newDate = addCalendarDays(anchorDate, offsets[idx]);
+      const dayOffset = Math.max(0, diffCalendarDays(plan.startDate, newDate));
+      const gapDays =
+        idx === 0 && !prevDate
+          ? 0
+          : prevDate
+            ? Math.max(0, diffCalendarDays(prevDate, newDate))
+            : 0;
+      prevDate = newDate;
+      updatesById.set(s.id, {
+        ...s,
+        originalScheduledDate: s.originalScheduledDate || s.scheduledDate,
+        scheduledDate: newDate,
+        dayOffset,
+        gapDays,
+        recalibrationCount: (s.recalibrationCount || 0) + 1,
+      });
+    });
+
+    const nextPlan = normalizePlanData({
+      ...plan,
+      masterByDate: workingMasterBy,
+      sessions: plan.sessions.map((s) => updatesById.get(s.id) || s),
+    });
+
+    return {
+      updatedPlan: nextPlan,
+      shiftedCount: pendingRows.length,
+      mergedCount: 0,
+      tier: extendApplied ? 'tier3_extended' : 'tier1_shifted',
+      recalibrated: true,
+    };
+  }
+
+  if (resolutionMode === 'tier1_only') {
+    return {
+      updatedPlan: plan,
+      shiftedCount: 0,
+      mergedCount: 0,
+      tier: 'no_pending_sessions',
+      recalibrated: false,
+    };
+  }
+
+  // Tier 2: Compressed runway (1 <= remainingDays < pendingRows.length)
+  const targetSlots = Math.max(1, remainingDays);
+  const lastIdx = pendingRows.length - 1;
+  const entries = pendingRows.map((s, idx) => ({
+    session: s,
+    protected: (s.chunkScope?.new?.length || 0) > 0 || idx === lastIdx,
+    prompts:
+      s.promptItems ||
+      s.prompts.map((p) => ({ prompt_text: p, expected_rubric_points: [] })),
+    checklist: [...(s.verificationChecklist || [])],
+    merged: false,
+    mergedInto: null as number | null,
+  }));
+
+  let keptCount = entries.length;
+  for (let i = 0; i < entries.length && keptCount > targetSlots; i++) {
+    if (entries[i].protected || entries[i].merged) continue;
+    const targetEntry = entries.slice(i + 1).find((e) => !e.merged);
+    if (!targetEntry) continue;
+    entries[i].merged = true;
+    entries[i].mergedInto = targetEntry.session.id;
+    targetEntry.prompts = mergeUniquePromptItemsLocal(
+      targetEntry.prompts,
+      entries[i].prompts
+    );
+    targetEntry.checklist = mergeUniqueChecklistLocal(
+      targetEntry.checklist,
+      entries[i].checklist
+    );
+    keptCount--;
+  }
+
+  const keptEntries = entries.filter((e) => !e.merged);
+  const offsets = computeExpandingOffsets(keptEntries.length, remainingDays);
+  const updatesById = new Map<number, StudySession>();
+  let prevDate = lastCompletedDate;
+  let latestDate = workingMasterBy;
+
+  for (const entry of entries) {
+    if (entry.merged) {
+      updatesById.set(entry.session.id, {
+        ...entry.session,
+        status: 'merged',
+        mergedIntoSessionId: entry.mergedInto,
+        recalibrationCount: (entry.session.recalibrationCount || 0) + 1,
+      });
+    }
+  }
+
+  keptEntries.forEach((entry, kPos) => {
+    let newDate = addCalendarDays(anchorDate, offsets[kPos]);
+    if (
+      kPos === keptEntries.length - 1 &&
+      keptEntries.length >= 2 &&
+      remainingDays >= keptEntries.length &&
+      newDate > workingMasterBy
+    ) {
+      newDate = workingMasterBy;
+    }
+    if (newDate > latestDate) latestDate = newDate;
+    const dayOffset = Math.max(0, diffCalendarDays(plan.startDate, newDate));
+    const gapDays =
+      kPos === 0 && !prevDate
+        ? 0
+        : prevDate
+          ? Math.max(0, diffCalendarDays(prevDate, newDate))
+          : 0;
+    prevDate = newDate;
+    updatesById.set(entry.session.id, {
+      ...entry.session,
+      originalScheduledDate:
+        entry.session.originalScheduledDate || entry.session.scheduledDate,
+      scheduledDate: newDate,
+      dayOffset,
+      gapDays,
+      promptItems: entry.prompts,
+      prompts: entry.prompts.map((pi) => pi.prompt_text),
+      verificationChecklist: entry.checklist,
+      recalibrationCount: (entry.session.recalibrationCount || 0) + 1,
+    });
+  });
+
+  const nextPlan = normalizePlanData({
+    ...plan,
+    masterByDate: latestDate,
+    sessions: plan.sessions.map((s) => updatesById.get(s.id) || s),
+  });
+
+  return {
+    updatedPlan: nextPlan,
+    shiftedCount: keptEntries.length,
+    mergedCount: entries.length - keptEntries.length,
+    tier: extendApplied ? 'tier3_extended' : 'tier2_compressed',
+    recalibrated: true,
+  };
+}
+
 export async function rescheduleOverdueSession(params: {
   plan: StudyPlan;
   session: StudySession;
   cascadeRemaining?: boolean;
+  resolutionMode?: RecalibrationResolutionMode;
   user?: UserAccount | null;
-}): Promise<{ updatedPlan: StudyPlan; shiftedCount: number }> {
+}): Promise<{
+  updatedPlan: StudyPlan;
+  shiftedCount: number;
+  mergedCount?: number;
+  tier?: RecalibrationTier;
+  options?: string[];
+}> {
   const today = formatLocalDate(new Date());
   const cascade = params.cascadeRemaining !== false;
+  const resolutionMode: RecalibrationResolutionMode = params.resolutionMode || 'auto';
   const activeUser = params.user || getStoredUser();
 
   try {
@@ -1082,8 +1422,11 @@ export async function rescheduleOverdueSession(params: {
       },
       body: JSON.stringify({
         action: 'reschedule_session',
+        planId: params.plan.id,
         sessionId: params.session.id,
         newScheduledDate: today,
+        anchorDate: today,
+        resolutionMode,
         cascadeRemaining: cascade,
       }),
     });
@@ -1095,72 +1438,43 @@ export async function rescheduleOverdueSession(params: {
           ...(data.plan as StudyPlan),
           studyWindow: params.plan.studyWindow,
         });
-        const plans = loadLocalPlans(activeUser).map((p) =>
-          p.id === updatedPlan.id ? updatedPlan : p
-        );
-        saveLocalPlans(plans, activeUser);
+        if (data.tier !== 'deadline_squeeze') {
+          const plans = loadLocalPlans(activeUser).map((p) =>
+            p.id === updatedPlan.id ? updatedPlan : p
+          );
+          saveLocalPlans(plans, activeUser);
+        }
         return {
           updatedPlan,
-          shiftedCount: Number(data.shiftedCount || 1),
+          shiftedCount: Number(data.shiftedCount || 0),
+          mergedCount: Number(data.mergedCount || 0),
+          tier: (data.tier as RecalibrationTier) || 'tier1_shifted',
+          options: Array.isArray(data.options) ? data.options : undefined,
         };
       }
     }
   } catch {
-    // Fallback to local schedule shifting
+    // Fallback to local 3-tier recalibration
   }
 
-  const deltaDays = Math.max(
-    0,
-    diffCalendarDays(params.session.scheduledDate, today)
+  const localRes = applyLocalThreeTierRecalibration(
+    params.plan,
+    today,
+    resolutionMode
   );
-  let prevDate = today;
-  let shiftedCount = 0;
-  let latestDate = params.plan.masterByDate;
-
-  const updatedSessions = params.plan.sessions.map((s) => {
-    if (s.id === params.session.id) {
-      shiftedCount++;
-      if (today > latestDate) latestDate = today;
-      return {
-        ...s,
-        scheduledDate: today,
-        dayOffset: Math.max(0, diffCalendarDays(params.plan.startDate, today)),
-      };
-    }
-
-    if (
-      cascade &&
-      deltaDays > 0 &&
-      s.status !== 'completed' &&
-      s.sessionNumber > params.session.sessionNumber
-    ) {
-      let nextDate = addCalendarDays(s.scheduledDate, deltaDays);
-      if (nextDate <= prevDate) {
-        nextDate = addCalendarDays(prevDate, Math.max(1, s.gapDays || 1));
-      }
-      prevDate = nextDate;
-      shiftedCount++;
-      if (nextDate > latestDate) latestDate = nextDate;
-      return {
-        ...s,
-        scheduledDate: nextDate,
-        dayOffset: Math.max(0, diffCalendarDays(params.plan.startDate, nextDate)),
-      };
-    }
-
-    return s;
-  });
-
-  const updatedPlan: StudyPlan = {
-    ...params.plan,
-    masterByDate: latestDate,
-    sessions: updatedSessions,
+  if (localRes.recalibrated) {
+    const plans = loadLocalPlans(activeUser).map((p) =>
+      p.id === localRes.updatedPlan.id ? localRes.updatedPlan : p
+    );
+    saveLocalPlans(plans, activeUser);
+  }
+  return {
+    updatedPlan: localRes.updatedPlan,
+    shiftedCount: localRes.shiftedCount,
+    mergedCount: localRes.mergedCount,
+    tier: localRes.tier,
+    options: localRes.options,
   };
-  const plans = loadLocalPlans(activeUser).map((p) =>
-    p.id === updatedPlan.id ? updatedPlan : p
-  );
-  saveLocalPlans(plans, activeUser);
-  return { updatedPlan, shiftedCount };
 }
 
 export async function submitRecallForGrading(params: {
@@ -1172,11 +1486,14 @@ export async function submitRecallForGrading(params: {
   evaluation: GradeRecallEvaluation;
   updatedPlan: StudyPlan;
   persistedInMySql: boolean;
+  recalibrated?: boolean;
 }> {
   let evaluation: GradeRecallEvaluation | null = null;
   let persistedInMySql = false;
   let serverAttemptId: number | null = null;
   let serverCompletedAt: string | null = null;
+  let serverRefreshedPlan: StudyPlan | null = null;
+  let serverRecalibrated = false;
   const activeUser = params.user || getStoredUser();
 
   const stageNumber = resolveStageNumber(params.session);
@@ -1213,6 +1530,13 @@ export async function submitRecallForGrading(params: {
           typeof data.attemptId === 'number' ? data.attemptId : null;
         serverCompletedAt =
           typeof data.completedAt === 'string' ? data.completedAt : null;
+        serverRecalibrated = Boolean(data.recalibrated);
+        if (persistedInMySql && data.plan) {
+          serverRefreshedPlan = normalizePlanData({
+            ...(data.plan as StudyPlan),
+            studyWindow: params.plan.studyWindow,
+          });
+        }
       }
     }
   } catch {
@@ -1225,6 +1549,19 @@ export async function submitRecallForGrading(params: {
       params.session,
       params.userResponseText
     );
+  }
+
+  if (persistedInMySql && serverRefreshedPlan) {
+    const plans = loadLocalPlans(activeUser).map((p) =>
+      p.id === serverRefreshedPlan!.id ? serverRefreshedPlan! : p
+    );
+    saveLocalPlans(plans, activeUser);
+    return {
+      evaluation,
+      updatedPlan: serverRefreshedPlan,
+      persistedInMySql: true,
+      recalibrated: serverRecalibrated,
+    };
   }
 
   const nowIso =
@@ -1274,6 +1611,7 @@ export async function submitRecallForGrading(params: {
             evaluation,
             updatedPlan: syncedPlan,
             persistedInMySql: true,
+            recalibrated: Boolean(saveData.recalibrated),
           };
         }
       }
@@ -1301,9 +1639,10 @@ export async function submitRecallForGrading(params: {
   };
 
   const plans = loadLocalPlans(activeUser);
-  const updatedPlans = plans.map((p) => {
+  let targetPlan: StudyPlan | null = null;
+  const completedPlans = plans.map((p) => {
     if (p.id !== params.plan.id) return p;
-    return {
+    const nextP: StudyPlan = {
       ...p,
       sessions: p.sessions.map((s) => {
         if (s.id !== params.session.id) return s;
@@ -1316,13 +1655,41 @@ export async function submitRecallForGrading(params: {
         };
       }),
     };
+    targetPlan = nextP;
+    return nextP;
   });
 
-  saveLocalPlans(updatedPlans, activeUser);
-  const updatedPlan =
-    updatedPlans.find((p) => p.id === params.plan.id) || params.plan;
+  // Offline completion-anchored Tier 1 hook if completing an overdue session
+  let localRecalibrated = false;
+  let finalPlans = completedPlans;
+  const today = formatLocalDate(new Date());
+  if (targetPlan && params.session.scheduledDate < today) {
+    const tier1Res = applyLocalThreeTierRecalibration(
+      targetPlan,
+      today,
+      'tier1_only'
+    );
+    if (tier1Res.recalibrated) {
+      localRecalibrated = true;
+      targetPlan = tier1Res.updatedPlan;
+      finalPlans = completedPlans.map((p) =>
+        p.id === targetPlan!.id ? targetPlan! : p
+      );
+    }
+  }
 
-  return { evaluation, updatedPlan, persistedInMySql };
+  saveLocalPlans(finalPlans, activeUser);
+  const updatedPlan =
+    targetPlan ||
+    finalPlans.find((p) => p.id === params.plan.id) ||
+    params.plan;
+
+  return {
+    evaluation,
+    updatedPlan,
+    persistedInMySql,
+    recalibrated: localRecalibrated,
+  };
 }
 
 export async function scheduleAdaptiveBoosterSession(params: {
@@ -1781,13 +2148,49 @@ function buildSynthesizedPlanFallback(params: {
     },
   ];
 
+  const wordCount = [params.topicPrompt, ...decodedSnippets]
+    .join(' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const mockClusters = coreConcepts.map((c, idx) => ({
+    cluster_id: `cluster-${idx + 1}`,
+    title: c.title,
+    key_concepts: [c.title],
+  }));
+  const routing = selectStudyMode(
+    params.scheduledBlueprints.length,
+    params.studyWindow.durationMinutes,
+    wordCount,
+    mockClusters,
+    Math.max(20, Math.round(wordCount / 80))
+  );
+  const skeleton = buildStageSkeleton(params.scheduledBlueprints.length);
+  const chunkScopes = assignSpiralChunkScopes(
+    params.scheduledBlueprints.length,
+    routing.mode,
+    routing.target_chunk_count
+  );
+
   const sessions: StudySession[] = params.scheduledBlueprints.map((bp, idx) => {
-    const stageNumber = resolveStageNumber({
-      stageNumber: bp.stageNumber,
-      stageName: bp.stageName,
-      sessionNumber: bp.sessionNumber,
-    });
-    const promptItems = buildStagePromptItemsFallback(stageNumber, cleanTitle);
+    const slot = skeleton[idx] || skeleton[skeleton.length - 1];
+    const scope = chunkScopes[idx] || null;
+    const defaultTag =
+      routing.mode === 'spiral_chunking' && scope
+        ? scope.new.length > 0
+          ? `New: Chunk ${scope.new[0]}`
+          : scope.review[0] === 'ALL'
+            ? 'Full Topic'
+            : `Review: Chunk ${scope.review[0]}`
+        : 'Full Topic';
+
+    const promptItems = buildStagePromptItemsFallback(
+      slot.stage_number,
+      cleanTitle
+    ).map((pi) => ({
+      ...pi,
+      chunk_tag: defaultTag,
+    }));
     const checklist = promptItems
       .flatMap((pi) => pi.expected_rubric_points)
       .slice(0, 6);
@@ -1796,16 +2199,24 @@ function buildSynthesizedPlanFallback(params: {
       id: planId + idx + 1,
       planId,
       sessionNumber: bp.sessionNumber,
-      stageNumber,
-      stageName: normalizeStageName(bp.stageName),
+      stageNumber: slot.stage_number,
+      stageName: normalizeStageName(slot.stage_name),
+      stageKey: slot.stage_key,
       scheduledDate: bp.scheduledDate,
+      originalScheduledDate: bp.scheduledDate,
       dayOffset: bp.dayOffset,
       gapDays: bp.gapDays,
-      cognitiveGoal: bp.cognitiveGoal,
+      cognitiveGoal: slot.cognitive_goal,
+      chunkScope: scope,
+      continuityHook:
+        idx === 0
+          ? ''
+          : `Building directly on your Session #${idx} recall, advance into ${slot.stage_name}.`,
       prompts: promptItems.map((pi) => pi.prompt_text),
       promptItems,
       verificationChecklist: checklist,
       status: 'pending',
+      recalibrationCount: 0,
       masteryScore: null,
       calendarEventId: null,
       completedAt: null,
@@ -1817,8 +2228,17 @@ function buildSynthesizedPlanFallback(params: {
     id: planId,
     userEmail: params.userEmail || 'learner@english-3d.com',
     topicTitle: cleanTitle,
+    studyMode: routing.mode,
+    targetChunkCount: routing.target_chunk_count,
+    studyWindowMinutes: params.studyWindow.durationMinutes,
     executiveSummary: `Evidence-based spaced retrieval plan for "${cleanTitle}" spanning ${params.startDate} to ${params.masterByDate} (${sessions.length} Cepeda-optimal sessions).`,
     coreConcepts,
+    blueprint: {
+      topicTitle: cleanTitle,
+      learningObjectives: coreConcepts.map((c) => c.title),
+      coreConcepts,
+      conceptClusters: mockClusters,
+    },
     sourceLinks: params.urls.map((u) => ({
       url: u,
       title: u,

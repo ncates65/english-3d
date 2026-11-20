@@ -24,6 +24,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 import {
+  RecalibrationResolutionMode,
   StudyPlan,
   StudySession,
   SyncMode,
@@ -148,6 +149,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [queueFilter, setQueueFilter] = useState<QueueFilter>('all_actionable');
   const [showAllUpcoming, setShowAllUpcoming] = useState(false);
   const [reschedulingSessionId, setReschedulingSessionId] = useState<number | null>(null);
+  const [deadlineSqueezeSessionId, setDeadlineSqueezeSessionId] = useState<number | null>(null);
 
   const [backendLive, setBackendLive] = useState(false);
   const [backendError, setBackendError] = useState<string | null>(null);
@@ -334,6 +336,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
       );
 
       for (const s of sortedSessions) {
+        if (s.status === 'merged') {
+          continue;
+        }
         totalSessions++;
         if (typeof s.masteryScore === 'number') {
           scoreSum += s.masteryScore;
@@ -438,22 +443,40 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   const handleRescheduleSession = async (
     plan: StudyPlan,
-    session: StudySession
+    session: StudySession,
+    resolutionMode: RecalibrationResolutionMode = 'auto'
   ) => {
     setReschedulingSessionId(session.id);
     try {
-      const { updatedPlan, shiftedCount } = await rescheduleOverdueSession({
+      const res = await rescheduleOverdueSession({
         plan,
         session,
+        resolutionMode,
         cascadeRemaining: true,
         user: currentUser,
       });
+
+      if (res.tier === 'deadline_squeeze') {
+        setDeadlineSqueezeSessionId(session.id);
+        return;
+      }
+
+      setDeadlineSqueezeSessionId(null);
       setPlans((prev) =>
-        prev.map((p) => (p.id === updatedPlan.id ? updatedPlan : p))
+        prev.map((p) => (p.id === res.updatedPlan.id ? res.updatedPlan : p))
       );
-      setBannerNotice(
-        `Rescheduled Session #${session.sessionNumber} of "${plan.topicTitle}" to today (${formatLocalDate(new Date())}) and cascaded ${Math.max(0, shiftedCount - 1)} subsequent interval${shiftedCount - 1 === 1 ? '' : 's'}.`
-      );
+
+      const mergedInfo =
+        res.mergedCount && res.mergedCount > 0
+          ? ` and consolidated ${res.mergedCount} review session${res.mergedCount === 1 ? '' : 's'} into upcoming blocks`
+          : '';
+      const modeText =
+        res.tier === 'tier3_final_sprint'
+          ? `Consolidated remaining sessions of "${plan.topicTitle}" into a Final Sprint today (${formatLocalDate(new Date())}).`
+          : res.tier === 'tier3_extended'
+            ? `Extended "${plan.topicTitle}" Master-By deadline (+7 days) and recalibrated ${res.shiftedCount} pending session${res.shiftedCount === 1 ? '' : 's'}${mergedInfo}.`
+            : `Shifted "${plan.topicTitle}" to today (${formatLocalDate(new Date())}) — recalibrated ${res.shiftedCount} pending session${res.shiftedCount === 1 ? '' : 's'}${mergedInfo}.`;
+      setBannerNotice(modeText);
     } catch (err) {
       setBackendError(
         err instanceof Error ? err.message : 'Unable to reschedule session.'
@@ -803,12 +826,17 @@ export const Dashboard: React.FC<DashboardProps> = ({
             session={activeSession}
             currentUser={currentUser}
             onBackToTimeline={handleBackToTimeline}
-            onPlanUpdated={(updatedPlan, refreshedSession) => {
+            onPlanUpdated={(updatedPlan, refreshedSession, recalibrated) => {
               setPlans((prev) =>
                 prev.map((p) => (p.id === updatedPlan.id ? updatedPlan : p))
               );
               if (refreshedSession) {
                 setActiveSessionId(refreshedSession.id);
+              }
+              if (recalibrated) {
+                setBannerNotice(
+                  'Completed your session and automatically recalibrated remaining pending sessions to keep you on track.'
+                );
               }
             }}
           />
@@ -958,9 +986,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       const isDueToday = category === 'today';
                       const isUpcoming = category === 'upcoming';
                       const isCompleted = category === 'completed';
+                      const isAdjusted = Boolean(
+                        session.originalScheduledDate &&
+                          session.scheduledDate !== session.originalScheduledDate
+                      );
+                      const showSqueezePrompt = deadlineSqueezeSessionId === session.id;
 
                       const cardContainerClass = isOverdue
-                        ? 'border border-red-200 dark:border-red-900/60 border-l-4 border-l-red-600 bg-red-50/70 dark:bg-red-950/25'
+                        ? 'border border-rose-200 dark:border-rose-900/60 border-l-4 border-l-amber-500 bg-amber-50/70 dark:bg-amber-950/25'
                         : isDueToday
                           ? 'border border-emerald-200 dark:border-emerald-900/60 border-l-4 border-l-emerald-600 bg-emerald-50/60 dark:bg-emerald-950/25'
                           : isUpcoming
@@ -974,29 +1007,36 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         >
                           <div className="space-y-1.5">
                             <div className="flex flex-wrap items-center justify-between gap-1.5">
-                              {isOverdue && (
-                                <span className="inline-flex items-center rounded-full bg-red-100 dark:bg-red-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-red-800 dark:text-red-200">
-                                  Overdue • {dayDelta}d Late
-                                </span>
-                              )}
-                              {isDueToday && (
-                                <span className="inline-flex items-center rounded-full bg-emerald-100 dark:bg-emerald-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-800 dark:text-emerald-200">
-                                  Due Today
-                                </span>
-                              )}
-                              {isUpcoming && (
-                                <span className="inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-300">
-                                  Upcoming • In {dayDelta} {dayDelta === 1 ? 'Day' : 'Days'} ({session.scheduledDate})
-                                </span>
-                              )}
-                              {isCompleted && (
-                                <span className="inline-flex items-center rounded-full bg-teal-100 dark:bg-teal-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-teal-800 dark:text-teal-200">
-                                  Completed
-                                  {typeof session.masteryScore === 'number'
-                                    ? ` • Score: ${session.masteryScore}%`
-                                    : ''}
-                                </span>
-                              )}
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {isOverdue && (
+                                  <span className="inline-flex items-center rounded-full bg-amber-100 dark:bg-amber-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-900 dark:text-amber-200">
+                                    Ready to resume • {dayDelta}d behind
+                                  </span>
+                                )}
+                                {isDueToday && (
+                                  <span className="inline-flex items-center rounded-full bg-emerald-100 dark:bg-emerald-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-800 dark:text-emerald-200">
+                                    Due Today
+                                  </span>
+                                )}
+                                {isUpcoming && (
+                                  <span className="inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-0.5 text-[11px] font-medium text-slate-700 dark:text-slate-300">
+                                    Upcoming • In {dayDelta} {dayDelta === 1 ? 'Day' : 'Days'} ({session.scheduledDate})
+                                  </span>
+                                )}
+                                {isCompleted && (
+                                  <span className="inline-flex items-center rounded-full bg-teal-100 dark:bg-teal-900/50 px-2.5 py-0.5 text-[11px] font-semibold text-teal-800 dark:text-teal-200">
+                                    Completed
+                                    {typeof session.masteryScore === 'number'
+                                      ? ` • Score: ${session.masteryScore}%`
+                                      : ''}
+                                  </span>
+                                )}
+                                {isAdjusted && (
+                                  <span className="inline-flex items-center rounded-full bg-teal-100/80 dark:bg-teal-950/60 px-2 py-0.5 text-[10px] font-medium text-teal-800 dark:text-teal-300">
+                                    Adjusted to keep you on track
+                                  </span>
+                                )}
+                              </div>
 
                               <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
                                 #{session.sessionNumber} • {session.scheduledDate}
@@ -1011,13 +1051,51 @@ export const Dashboard: React.FC<DashboardProps> = ({
                             </div>
                           </div>
 
+                          {showSqueezePrompt && (
+                            <div className="rounded-lg border border-amber-300 dark:border-amber-800 bg-white/90 dark:bg-slate-900 p-2.5 space-y-2 text-[11px]">
+                              <div className="font-semibold text-amber-900 dark:text-amber-200">
+                                Master-By date ({plan.masterByDate}) leaves zero future buffer days. Choose how to recalibrate:
+                              </div>
+                              <div className="flex flex-wrap gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={reschedulingSessionId === session.id}
+                                  onClick={() =>
+                                    handleRescheduleSession(
+                                      plan,
+                                      session,
+                                      'extend_7_days'
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-50 transition"
+                                >
+                                  Extend Master-By (+7 Days)
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={reschedulingSessionId === session.id}
+                                  onClick={() =>
+                                    handleRescheduleSession(
+                                      plan,
+                                      session,
+                                      'final_sprint_today'
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1 rounded-md border border-rose-300 dark:border-rose-700 bg-rose-50 dark:bg-rose-950/40 px-2.5 py-1 text-[11px] font-semibold text-rose-800 dark:text-rose-200 hover:bg-rose-100 disabled:opacity-50 transition"
+                                >
+                                  Run Final Sprint Today
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
                           <div className="flex items-center gap-2">
                             {isOverdue && (
                               <>
                                 <button
                                   type="button"
                                   onClick={() => handleLaunchSession(plan.id, session)}
-                                  className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-500 transition"
+                                  className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-500 transition"
                                 >
                                   <Play className="h-3 w-3 fill-current" />
                                   Catch Up Now
@@ -1025,13 +1103,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
                                 <button
                                   type="button"
                                   disabled={reschedulingSessionId === session.id}
-                                  onClick={() => handleRescheduleSession(plan, session)}
-                                  className="inline-flex items-center justify-center gap-1 rounded-lg border border-red-300 dark:border-red-800 bg-white/80 dark:bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-red-700 dark:text-red-300 hover:bg-red-100/70 dark:hover:bg-red-950/50 disabled:opacity-50 transition"
+                                  onClick={() =>
+                                    handleRescheduleSession(plan, session, 'auto')
+                                  }
+                                  className="inline-flex items-center justify-center gap-1 rounded-lg border border-rose-300 dark:border-rose-800 bg-white/80 dark:bg-slate-900 px-2.5 py-1.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/50 disabled:opacity-50 transition"
                                 >
                                   <CalendarClock className="h-3 w-3" />
                                   {reschedulingSessionId === session.id
                                     ? 'Shifting...'
-                                    : 'Reschedule'}
+                                    : 'Shift Plan to Today'}
                                 </button>
                               </>
                             )}
@@ -1115,7 +1195,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       <Calendar className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
                       <span>{p.topicTitle}</span>
                       <span className="rounded-md bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-700 dark:text-slate-300">
-                        {p.sessions.length}s
+                        {p.sessions.filter((s) => s.status !== 'merged').length}s
                       </span>
                     </button>
                   );
