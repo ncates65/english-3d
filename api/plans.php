@@ -2,144 +2,25 @@
 declare(strict_types=1);
 
 /**
- * SpacedPractice AI — Study Plans, Scheduled Sessions & Recall Attempts CRUD API
- * Endpoint: https://english-3D.com/study/api/plans.php
+ * Practice Buddy ("PB") — Study Plans, Scheduled Sessions & Recall Attempts CRUD API
+ * Endpoint: https://english-3d.com/study/api/plans.php
  */
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/spacing_helpers.php';
 sendJsonHeaders();
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $action = $_GET['action'] ?? '';
 
-/**
- * Format a raw database study_sessions row into a typed frontend structure.
- *
- * @param array<string, mixed> $row
- * @param array<int, array<string, mixed>> $attempts
- * @return array<string, mixed>
- */
-function formatSessionRow(array $row, array $attempts = []): array {
-    return [
-        'id' => (int) $row['id'],
-        'planId' => (int) $row['plan_id'],
-        'sessionNumber' => (int) $row['session_number'],
-        'stageName' => (string) $row['stage_name'],
-        'scheduledDate' => (string) $row['scheduled_date'],
-        'dayOffset' => (int) $row['day_offset'],
-        'gapDays' => (int) $row['gap_days'],
-        'cognitiveGoal' => (string) $row['cognitive_goal'],
-        'prompts' => json_decode((string) $row['prompts_json'], true) ?: [],
-        'verificationChecklist' => json_decode((string) $row['verification_checklist_json'], true) ?: [],
-        'status' => (string) $row['status'],
-        'masteryScore' => $row['mastery_score'] !== null ? (int) $row['mastery_score'] : null,
-        'calendarEventId' => $row['calendar_event_id'] !== null ? (string) $row['calendar_event_id'] : null,
-        'completedAt' => $row['completed_at'] !== null ? (string) $row['completed_at'] : null,
-        'attempts' => $attempts,
-    ];
-}
-
-/**
- * Format a raw database recall_attempts row.
- *
- * @param array<string, mixed> $row
- * @return array<string, mixed>
- */
-function formatAttemptRow(array $row): array {
-    return [
-        'id' => (int) $row['id'],
-        'sessionId' => (int) $row['session_id'],
-        'userResponseText' => (string) $row['user_response_text'],
-        'aiScore' => (int) $row['ai_score'],
-        'strengths' => json_decode((string) $row['strengths_json'], true) ?: [],
-        'missingConcepts' => json_decode((string) $row['missing_concepts_json'], true) ?: [],
-        'correctiveFeedback' => (string) $row['corrective_feedback'],
-        'followUpQuestion' => (string) $row['follow_up_question'],
-        'createdAt' => (string) $row['created_at'],
-    ];
-}
-
-/**
- * Load full study plan(s) with nested sessions and recall attempts.
- *
- * @param PDO $pdo
- * @param int|null $planId
- * @param string|null $userEmail
- * @return array<int, array<string, mixed>>
- */
-function loadStudyPlans(PDO $pdo, ?int $planId = null, ?string $userEmail = null): array {
-    if ($planId !== null) {
-        $stmt = $pdo->prepare('SELECT * FROM study_plans WHERE id = :id LIMIT 1');
-        $stmt->execute([':id' => $planId]);
-    } elseif ($userEmail !== null && $userEmail !== '') {
-        $stmt = $pdo->prepare('SELECT * FROM study_plans WHERE user_email = :email ORDER BY created_at DESC');
-        $stmt->execute([':email' => $userEmail]);
-    } else {
-        $stmt = $pdo->query('SELECT * FROM study_plans ORDER BY created_at DESC');
-    }
-
-    $planRows = $stmt->fetchAll();
-    if (!$planRows) {
-        return [];
-    }
-
-    $planIds = array_map(static fn(array $r): int => (int) $r['id'], $planRows);
-    $placeholders = implode(',', array_fill(0, count($planIds), '?'));
-
-    $sessionStmt = $pdo->prepare(
-        "SELECT * FROM study_sessions WHERE plan_id IN ({$placeholders}) ORDER BY scheduled_date ASC, session_number ASC"
-    );
-    $sessionStmt->execute($planIds);
-    $sessionRows = $sessionStmt->fetchAll();
-
-    $sessionIds = array_map(static fn(array $s): int => (int) $s['id'], $sessionRows);
-    $attemptsBySession = [];
-
-    if (!empty($sessionIds)) {
-        $sPlaceholders = implode(',', array_fill(0, count($sessionIds), '?'));
-        $attemptStmt = $pdo->prepare(
-            "SELECT * FROM recall_attempts WHERE session_id IN ({$sPlaceholders}) ORDER BY created_at DESC"
-        );
-        $attemptStmt->execute($sessionIds);
-        foreach ($attemptStmt->fetchAll() as $aRow) {
-            $sid = (int) $aRow['session_id'];
-            $attemptsBySession[$sid][] = formatAttemptRow($aRow);
-        }
-    }
-
-    $sessionsByPlan = [];
-    foreach ($sessionRows as $sRow) {
-        $pid = (int) $sRow['plan_id'];
-        $sid = (int) $sRow['id'];
-        $sessionsByPlan[$pid][] = formatSessionRow($sRow, $attemptsBySession[$sid] ?? []);
-    }
-
-    $result = [];
-    foreach ($planRows as $pRow) {
-        $pid = (int) $pRow['id'];
-        $result[] = [
-            'id' => $pid,
-            'userEmail' => (string) $pRow['user_email'],
-            'topicTitle' => (string) $pRow['topic_title'],
-            'executiveSummary' => (string) $pRow['executive_summary'],
-            'coreConcepts' => json_decode((string) $pRow['core_concepts_json'], true) ?: [],
-            'sourceLinks' => json_decode((string) $pRow['source_links_json'], true) ?: [],
-            'extractedContextCache' => (string) $pRow['extracted_context_cache'],
-            'startDate' => (string) $pRow['start_date'],
-            'masterByDate' => (string) $pRow['master_by_date'],
-            'createdAt' => (string) $pRow['created_at'],
-            'sessions' => $sessionsByPlan[$pid] ?? [],
-        ];
-    }
-
-    return $result;
-}
-
 // =============================================================================
-// GET — Fetch All Plans, Single Plan by plan_id, or Single Session by session_id
+// GET — Fetch All Plans for Current User, Single Plan, or Single Session
 // =============================================================================
 if ($method === 'GET') {
     $pdo = getDbConnection();
+    $currentUser = resolveEffectiveUserRow($pdo, []);
+    $currentUserId = (int) $currentUser['id'];
 
     if (isset($_GET['session_id']) && is_numeric($_GET['session_id'])) {
         $sessionId = (int) $_GET['session_id'];
@@ -154,6 +35,7 @@ if ($method === 'GET') {
             'ok' => true,
             'plan' => $plans[0] ?? null,
             'targetSessionId' => $sessionId,
+            'user' => formatUserRow($currentUser),
         ]);
     }
 
@@ -162,14 +44,18 @@ if ($method === 'GET') {
         if (empty($plans)) {
             respondJson(['ok' => false, 'error' => 'Study plan not found.'], 404);
         }
-        respondJson(['ok' => true, 'plan' => $plans[0]]);
+        respondJson([
+            'ok' => true,
+            'plan' => $plans[0],
+            'user' => formatUserRow($currentUser),
+        ]);
     }
 
-    $userEmail = isset($_GET['user_email']) ? trim((string) $_GET['user_email']) : null;
-    $plans = loadStudyPlans($pdo, null, $userEmail);
+    $plans = loadStudyPlans($pdo, null, $currentUserId);
     respondJson([
         'ok' => true,
         'plans' => $plans,
+        'user' => formatUserRow($currentUser),
         'config' => [
             'googleOAuthClientId' => GOOGLE_OAUTH_CLIENT_ID,
             'appBaseUrl' => APP_BASE_URL,
@@ -179,18 +65,20 @@ if ($method === 'GET') {
 }
 
 // =============================================================================
-// POST — Create Plan, Schedule Adaptive Booster Session (+2 Days), or Sync Event IDs
+// POST — Create Plan, Reschedule Session, Adaptive Booster, Save Recall, Delete
 // =============================================================================
 if ($method === 'POST') {
     $pdo = getDbConnection();
     $body = getJsonBody();
     $action = $action !== '' ? $action : (string) ($body['action'] ?? 'create_plan');
+    $currentUser = resolveEffectiveUserRow($pdo, $body);
+    $currentUserId = (int) $currentUser['id'];
 
     // -------------------------------------------------------------------------
     // Action 1: create_plan — Save a newly generated Study Plan & its Sessions
     // -------------------------------------------------------------------------
     if ($action === 'create_plan') {
-        $userEmail = trim((string) ($body['userEmail'] ?? 'learner@english-3d.com'));
+        $userEmail = trim((string) ($currentUser['email'] ?: ($body['userEmail'] ?? 'learner@english-3d.com')));
         $topicTitle = trim((string) ($body['topicTitle'] ?? ''));
         $executiveSummary = trim((string) ($body['executiveSummary'] ?? ''));
         $coreConcepts = is_array($body['coreConcepts'] ?? null) ? $body['coreConcepts'] : [];
@@ -207,19 +95,29 @@ if ($method === 'POST') {
             ], 400);
         }
 
+        $studyMode = ((string) ($body['studyMode'] ?? 'deepening')) === 'spiral_chunking' ? 'spiral_chunking' : 'deepening';
+        $targetChunkCount = max(1, min(10, (int) ($body['targetChunkCount'] ?? 1)));
+        $studyWindowMinutes = max(10, min(240, (int) ($body['studyWindowMinutes'] ?? 30)));
+        $blueprintPayload = is_array($body['blueprint'] ?? null) ? $body['blueprint'] : null;
+
         try {
             $pdo->beginTransaction();
 
             $planStmt = $pdo->prepare(
                 'INSERT INTO study_plans
-                (user_email, topic_title, executive_summary, core_concepts_json, source_links_json, extracted_context_cache, start_date, master_by_date)
-                VALUES (:user_email, :topic_title, :executive_summary, :core_concepts_json, :source_links_json, :extracted_context_cache, :start_date, :master_by_date)'
+                (user_id, user_email, topic_title, study_mode, target_chunk_count, study_window_minutes, executive_summary, core_concepts_json, blueprint_json, source_links_json, extracted_context_cache, start_date, master_by_date)
+                VALUES (:user_id, :user_email, :topic_title, :study_mode, :target_chunk_count, :study_window_minutes, :executive_summary, :core_concepts_json, :blueprint_json, :source_links_json, :extracted_context_cache, :start_date, :master_by_date)'
             );
             $planStmt->execute([
-                ':user_email' => $userEmail,
-                ':topic_title' => $topicTitle,
+                ':user_id' => $currentUserId,
+                ':user_email' => mb_substr($userEmail, 0, 255),
+                ':topic_title' => mb_substr($topicTitle, 0, 255),
+                ':study_mode' => $studyMode,
+                ':target_chunk_count' => $targetChunkCount,
+                ':study_window_minutes' => $studyWindowMinutes,
                 ':executive_summary' => $executiveSummary,
                 ':core_concepts_json' => json_encode($coreConcepts, JSON_UNESCAPED_UNICODE),
+                ':blueprint_json' => $blueprintPayload !== null ? json_encode($blueprintPayload, JSON_UNESCAPED_UNICODE) : null,
                 ':source_links_json' => json_encode($sourceLinks, JSON_UNESCAPED_UNICODE),
                 ':extracted_context_cache' => $extractedContextCache,
                 ':start_date' => $startDate,
@@ -230,23 +128,91 @@ if ($method === 'POST') {
 
             $sessionStmt = $pdo->prepare(
                 'INSERT INTO study_sessions
-                (plan_id, session_number, stage_name, scheduled_date, day_offset, gap_days, cognitive_goal, prompts_json, verification_checklist_json, status)
-                VALUES (:plan_id, :session_number, :stage_name, :scheduled_date, :day_offset, :gap_days, :cognitive_goal, :prompts_json, :verification_checklist_json, :status)'
+                (plan_id, user_id, session_number, stage_number, stage_name, stage_key, scheduled_date, original_scheduled_date, day_offset, gap_days, cognitive_goal, chunk_scope_json, continuity_hook, prompts_json, verification_checklist_json, status, recalibration_count, mastery_score, completed_at)
+                VALUES (:plan_id, :user_id, :session_number, :stage_number, :stage_name, :stage_key, :scheduled_date, :original_scheduled_date, :day_offset, :gap_days, :cognitive_goal, :chunk_scope_json, :continuity_hook, :prompts_json, :verification_checklist_json, :status, :recalibration_count, :mastery_score, :completed_at)'
+            );
+
+            $attemptStmt = $pdo->prepare(
+                'INSERT INTO recall_attempts
+                (session_id, user_response_text, ai_score, strengths_json, missing_concepts_json, corrective_feedback, cognitive_stage_check, follow_up_question)
+                VALUES (:session_id, :user_response_text, :ai_score, :strengths_json, :missing_concepts_json, :corrective_feedback, :cognitive_stage_check, :follow_up_question)'
             );
 
             foreach ($sessions as $idx => $session) {
+                $rawStatus = (string) ($session['status'] ?? 'pending');
+                $status = in_array($rawStatus, ['completed', 'merged'], true) ? $rawStatus : 'pending';
+                $masteryScore = isset($session['masteryScore']) && $session['masteryScore'] !== null
+                    ? max(0, min(100, (int) $session['masteryScore']))
+                    : null;
+                $rawCompletedAt = trim((string) ($session['completedAt'] ?? ''));
+                $completedTs = $rawCompletedAt !== '' ? strtotime($rawCompletedAt) : false;
+                $completedAt = $status === 'completed'
+                    ? ($completedTs !== false ? date('Y-m-d H:i:s', $completedTs) : date('Y-m-d H:i:s'))
+                    : null;
+
+                $sessNum = (int) ($session['sessionNumber'] ?? ($idx + 1));
+                $stageName = pbNormalizeStageLabel((string) ($session['stageName'] ?? 'Stage 1: Schema Mapping'));
+                $stageKey = trim((string) ($session['stageKey'] ?? ''));
+                $stageNum = isset($session['stageNumber'])
+                    ? max(1, min(5, (int) $session['stageNumber']))
+                    : pbInferStageNumber($stageName, $sessNum, $stageKey);
+                if ($stageKey === '') {
+                    $stageKey = match ($stageNum) {
+                        1 => 'schema_mapping',
+                        2 => 'closed_book_free_recall',
+                        3 => 'elaborative_interrogation',
+                        4 => 'application_edge_cases',
+                        default => 'mastery_verification',
+                    };
+                }
+
+                $schedDate = (string) ($session['scheduledDate'] ?? $startDate);
+                $origSchedDate = !empty($session['originalScheduledDate']) ? (string) $session['originalScheduledDate'] : $schedDate;
+
+                $promptsPayload = is_array($session['promptItems'] ?? null) && !empty($session['promptItems'])
+                    ? $session['promptItems']
+                    : (is_array($session['prompts'] ?? null) ? $session['prompts'] : []);
+
                 $sessionStmt->execute([
                     ':plan_id' => $planId,
-                    ':session_number' => (int) ($session['sessionNumber'] ?? ($idx + 1)),
-                    ':stage_name' => (string) ($session['stageName'] ?? 'Active Recall Session'),
-                    ':scheduled_date' => (string) ($session['scheduledDate'] ?? $startDate),
+                    ':user_id' => $currentUserId,
+                    ':session_number' => $sessNum,
+                    ':stage_number' => $stageNum,
+                    ':stage_name' => mb_substr($stageName, 0, 160),
+                    ':stage_key' => mb_substr($stageKey, 0, 64),
+                    ':scheduled_date' => $schedDate,
+                    ':original_scheduled_date' => $origSchedDate,
                     ':day_offset' => (int) ($session['dayOffset'] ?? 0),
                     ':gap_days' => (int) ($session['gapDays'] ?? 0),
                     ':cognitive_goal' => (string) ($session['cognitiveGoal'] ?? ''),
-                    ':prompts_json' => json_encode($session['prompts'] ?? [], JSON_UNESCAPED_UNICODE),
+                    ':chunk_scope_json' => is_array($session['chunkScope'] ?? null) ? json_encode($session['chunkScope'], JSON_UNESCAPED_UNICODE) : null,
+                    ':continuity_hook' => isset($session['continuityHook']) ? (string) $session['continuityHook'] : '',
+                    ':prompts_json' => json_encode($promptsPayload, JSON_UNESCAPED_UNICODE),
                     ':verification_checklist_json' => json_encode($session['verificationChecklist'] ?? [], JSON_UNESCAPED_UNICODE),
-                    ':status' => 'pending',
+                    ':status' => $status,
+                    ':recalibration_count' => (int) ($session['recalibrationCount'] ?? 0),
+                    ':mastery_score' => $masteryScore,
+                    ':completed_at' => $completedAt,
                 ]);
+
+                $newSessionId = (int) $pdo->lastInsertId();
+                $attempts = is_array($session['attempts'] ?? null) ? $session['attempts'] : [];
+                foreach ($attempts as $att) {
+                    $attText = trim((string) ($att['userResponseText'] ?? ''));
+                    if ($attText === '') {
+                        continue;
+                    }
+                    $attemptStmt->execute([
+                        ':session_id' => $newSessionId,
+                        ':user_response_text' => $attText,
+                        ':ai_score' => max(0, min(100, (int) ($att['aiScore'] ?? $masteryScore ?? 0))),
+                        ':strengths_json' => json_encode($att['strengths'] ?? [], JSON_UNESCAPED_UNICODE),
+                        ':missing_concepts_json' => json_encode($att['missingConcepts'] ?? [], JSON_UNESCAPED_UNICODE),
+                        ':corrective_feedback' => (string) ($att['correctiveFeedback'] ?? ''),
+                        ':cognitive_stage_check' => (string) ($att['cognitiveStageCheck'] ?? ''),
+                        ':follow_up_question' => (string) ($att['followUpQuestion'] ?? ''),
+                    ]);
+                }
             }
 
             $pdo->commit();
@@ -268,7 +234,44 @@ if ($method === 'POST') {
     }
 
     // -------------------------------------------------------------------------
-    // Action 2: add_booster_session — Adaptive Spacing Hook (+2 Days) when score < 70
+    // Action 2: reschedule_session / recalibrate_plan — Three-Tier Recalibration
+    // -------------------------------------------------------------------------
+    if ($action === 'reschedule_session' || $action === 'recalibrate_plan') {
+        $planId = (int) ($body['planId'] ?? 0);
+        $sessionId = (int) ($body['sessionId'] ?? 0);
+        $anchorDate = trim((string) ($body['anchorDate'] ?? $body['newScheduledDate'] ?? date('Y-m-d')));
+        $resolutionMode = trim((string) ($body['resolutionMode'] ?? $body['mode'] ?? 'auto'));
+
+        if (!in_array($resolutionMode, ['auto', 'extend_7_days', 'final_sprint_today', 'tier1_only'], true)) {
+            $resolutionMode = 'auto';
+        }
+
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $anchorDate)) {
+            respondJson(['ok' => false, 'error' => 'Valid YYYY-MM-DD anchorDate / newScheduledDate is required.'], 400);
+        }
+
+        if ($planId <= 0 && $sessionId > 0) {
+            $lookupStmt = $pdo->prepare('SELECT plan_id FROM study_sessions WHERE id = :id LIMIT 1');
+            $lookupStmt->execute([':id' => $sessionId]);
+            $row = $lookupStmt->fetch();
+            if ($row) {
+                $planId = (int) $row['plan_id'];
+            }
+        }
+
+        if ($planId <= 0) {
+            respondJson(['ok' => false, 'error' => 'Valid planId or sessionId is required.'], 404);
+        }
+
+        $recal = recalibratePlanSchedule($pdo, $planId, $anchorDate, $resolutionMode);
+        if (empty($recal['ok'])) {
+            respondJson($recal, 500);
+        }
+        respondJson($recal);
+    }
+
+    // -------------------------------------------------------------------------
+    // Action 3: add_booster_session — Adaptive Spacing Hook (+2 Days) when score < 70
     // -------------------------------------------------------------------------
     if ($action === 'add_booster_session') {
         $sessionId = (int) ($body['sessionId'] ?? 0);
@@ -289,50 +292,63 @@ if ($method === 'POST') {
         }
 
         $planId = (int) $sourceSession['plan_id'];
+        $sessionOwnerId = (int) ($sourceSession['user_id'] ?? $currentUserId);
         $baseDate = (string) $sourceSession['scheduled_date'];
         $today = date('Y-m-d');
         $anchorDate = $baseDate > $today ? $baseDate : $today;
-        $boosterDate = date('Y-m-d', strtotime($anchorDate . ' +2 days'));
+        $boosterDate = pbAddCalendarDays($anchorDate, 2);
 
         $startDate = (string) $sourceSession['start_date'];
-        $dayOffset = max(1, (int) round((strtotime($boosterDate) - strtotime($startDate)) / 86400));
+        $dayOffset = max(1, pbDiffCalendarDays($startDate, $boosterDate));
 
         // Build targeted remedial prompts from missed concepts + Socratic follow-up
-        $remedialPrompts = [];
+        $remedialItems = [];
         if ($followUpQuestion !== '') {
-            $remedialPrompts[] = "Socratic Remediation: {$followUpQuestion}";
+            $remedialItems[] = [
+                'prompt_text' => "Socratic Remediation: {$followUpQuestion}",
+                'chunk_tag' => 'Review: Remediation',
+                'expected_rubric_points' => array_slice(array_map('strval', $missingConcepts), 0, 3),
+            ];
         }
         foreach (array_slice($missingConcepts, 0, 3) as $concept) {
-            $remedialPrompts[] = "Closed-Book Corrective Retrieval: Explain the mechanism, boundaries, and significance of \"{$concept}\" without consulting notes.";
+            $remedialItems[] = [
+                'prompt_text' => "Closed-Book Corrective Retrieval: Explain the mechanism, boundaries, and significance of \"{$concept}\" without consulting notes.",
+                'chunk_tag' => 'Review: Remediation',
+                'expected_rubric_points' => ["Accurately reconstructs {$concept} from memory", 'Links mechanism to core topic'],
+            ];
         }
-        if (empty($remedialPrompts)) {
-            $origPrompts = json_decode((string) $sourceSession['prompts_json'], true) ?: [];
-            $remedialPrompts = array_slice($origPrompts, 0, 3);
+        if (empty($remedialItems)) {
+            $origUnpacked = unpackPromptsPayload(json_decode((string) $sourceSession['prompts_json'], true));
+            $remedialItems = array_slice($origUnpacked['promptItems'], 0, 3);
         }
 
         $checklist = !empty($missingConcepts)
             ? array_map(static fn($c) => "Accurately retrieved and articulated: {$c}", $missingConcepts)
             : (json_decode((string) $sourceSession['verification_checklist_json'], true) ?: []);
 
-        // Count existing sessions to assign session_number and re-order cleanly
         $countStmt = $pdo->prepare('SELECT COALESCE(MAX(session_number), 0) + 1 AS next_num FROM study_sessions WHERE plan_id = :pid');
         $countStmt->execute([':pid' => $planId]);
         $nextNum = (int) ($countStmt->fetch()['next_num'] ?? 1);
+        $stageNum = isset($sourceSession['stage_number']) ? max(1, min(5, (int) $sourceSession['stage_number'])) : 4;
 
         $insertStmt = $pdo->prepare(
             'INSERT INTO study_sessions
-            (plan_id, session_number, stage_name, scheduled_date, day_offset, gap_days, cognitive_goal, prompts_json, verification_checklist_json, status)
-            VALUES (:plan_id, :session_number, :stage_name, :scheduled_date, :day_offset, :gap_days, :cognitive_goal, :prompts_json, :verification_checklist_json, :status)'
+            (plan_id, user_id, session_number, stage_number, stage_name, stage_key, scheduled_date, original_scheduled_date, day_offset, gap_days, cognitive_goal, prompts_json, verification_checklist_json, status, recalibration_count)
+            VALUES (:plan_id, :user_id, :session_number, :stage_number, :stage_name, :stage_key, :scheduled_date, :original_scheduled_date, :day_offset, :gap_days, :cognitive_goal, :prompts_json, :verification_checklist_json, :status, 0)'
         );
         $insertStmt->execute([
             ':plan_id' => $planId,
+            ':user_id' => $sessionOwnerId,
             ':session_number' => $nextNum,
+            ':stage_number' => $stageNum,
             ':stage_name' => 'Adaptive Booster — Targeted Error Remediation (+2d)',
+            ':stage_key' => 'adaptive_booster',
             ':scheduled_date' => $boosterDate,
+            ':original_scheduled_date' => $boosterDate,
             ':day_offset' => $dayOffset,
             ':gap_days' => 2,
             ':cognitive_goal' => 'Consolidate fragile memory traces and eliminate retrieval gaps identified in Session #' . $sourceSession['session_number'] . '.',
-            ':prompts_json' => json_encode($remedialPrompts, JSON_UNESCAPED_UNICODE),
+            ':prompts_json' => json_encode($remedialItems, JSON_UNESCAPED_UNICODE),
             ':verification_checklist_json' => json_encode($checklist, JSON_UNESCAPED_UNICODE),
             ':status' => 'pending',
         ]);
@@ -349,7 +365,7 @@ if ($method === 'POST') {
     }
 
     // -------------------------------------------------------------------------
-    // Action 3: update_calendar_sync — Store Google Calendar / Tasks Event IDs
+    // Action 4: update_calendar_sync — Store Google Calendar / Tasks Event IDs
     // -------------------------------------------------------------------------
     if ($action === 'update_calendar_sync') {
         $mappings = is_array($body['mappings'] ?? null) ? $body['mappings'] : [];
@@ -365,6 +381,131 @@ if ($method === 'POST') {
         respondJson(['ok' => true, 'updatedCount' => count($mappings)]);
     }
 
+    // -------------------------------------------------------------------------
+    // Action 5: save_recall_attempt — Persist graded recall attempt & mark completed
+    // -------------------------------------------------------------------------
+    if ($action === 'save_recall_attempt') {
+        $sessionId = (int) ($body['sessionId'] ?? 0);
+        $userResponseText = trim((string) ($body['userResponseText'] ?? ''));
+
+        if ($sessionId <= 0 || $userResponseText === '') {
+            respondJson([
+                'ok' => false,
+                'error' => 'sessionId and userResponseText are required to save a recall attempt.',
+            ], 400);
+        }
+
+        $score = max(0, min(100, (int) ($body['masteryScore'] ?? $body['aiScore'] ?? 0)));
+        $accuratePoints = is_array($body['whatYouNailed'] ?? null)
+            ? $body['whatYouNailed']
+            : (is_array($body['accuratePoints'] ?? null)
+                ? $body['accuratePoints']
+                : (is_array($body['strengths'] ?? null) ? $body['strengths'] : []));
+        $missedConcepts = is_array($body['missingToReview'] ?? null)
+            ? $body['missingToReview']
+            : (is_array($body['missedOrInaccurateConcepts'] ?? null)
+                ? $body['missedOrInaccurateConcepts']
+                : (is_array($body['missingConcepts'] ?? null) ? $body['missingConcepts'] : []));
+        $coachFeedback = (string) ($body['coachFeedback'] ?? $body['correctiveFeedback'] ?? '');
+        $cognitiveStageCheck = (string) ($body['cognitiveStageCheck'] ?? '');
+        $socraticQuestion = (string) ($body['socraticFollowUpQuestion'] ?? $body['followUpQuestion'] ?? '');
+
+        $rawCompletedAt = trim((string) ($body['completedAt'] ?? ''));
+        $completedTs = $rawCompletedAt !== '' ? strtotime($rawCompletedAt) : false;
+        $completedAt = $completedTs !== false ? date('Y-m-d H:i:s', $completedTs) : date('Y-m-d H:i:s');
+
+        $lookupStmt = $pdo->prepare('SELECT plan_id, scheduled_date FROM study_sessions WHERE id = :id LIMIT 1');
+        $lookupStmt->execute([':id' => $sessionId]);
+        $sessRow = $lookupStmt->fetch();
+        if (!$sessRow) {
+            respondJson(['ok' => false, 'error' => 'Target study session not found in MySQL.'], 404);
+        }
+        $planId = (int) $sessRow['plan_id'];
+        $sessScheduledDate = (string) ($sessRow['scheduled_date'] ?? '');
+
+        try {
+            $pdo->beginTransaction();
+
+            $attStmt = $pdo->prepare(
+                'INSERT INTO recall_attempts
+                (session_id, user_response_text, ai_score, strengths_json, missing_concepts_json, corrective_feedback, cognitive_stage_check, follow_up_question)
+                VALUES (:session_id, :user_response_text, :ai_score, :strengths_json, :missing_concepts_json, :corrective_feedback, :cognitive_stage_check, :follow_up_question)'
+            );
+            $attStmt->execute([
+                ':session_id' => $sessionId,
+                ':user_response_text' => $userResponseText,
+                ':ai_score' => $score,
+                ':strengths_json' => json_encode($accuratePoints, JSON_UNESCAPED_UNICODE),
+                ':missing_concepts_json' => json_encode($missedConcepts, JSON_UNESCAPED_UNICODE),
+                ':corrective_feedback' => $coachFeedback,
+                ':cognitive_stage_check' => $cognitiveStageCheck,
+                ':follow_up_question' => $socraticQuestion,
+            ]);
+            $attemptId = (int) $pdo->lastInsertId();
+
+            $updStmt = $pdo->prepare(
+                "UPDATE study_sessions
+                 SET status = 'completed', mastery_score = :score, completed_at = :completed_at
+                 WHERE id = :id"
+            );
+            $updStmt->execute([
+                ':score' => $score,
+                ':completed_at' => $completedAt,
+                ':id' => $sessionId,
+            ]);
+
+            $pdo->commit();
+
+            // Completion-Anchored Hook: auto-run Tier 1 recalibration if completing an overdue session
+            $recalibrated = false;
+            $refreshedPlan = null;
+            $today = date('Y-m-d');
+            if ($sessScheduledDate !== '' && $sessScheduledDate < $today) {
+                $recal = recalibratePlanSchedule($pdo, $planId, $today, 'tier1_only');
+                if (!empty($recal['recalibrated']) && !empty($recal['plan'])) {
+                    $recalibrated = true;
+                    $refreshedPlan = $recal['plan'];
+                }
+            }
+            if ($refreshedPlan === null) {
+                $updatedPlans = loadStudyPlans($pdo, $planId);
+                $refreshedPlan = $updatedPlans[0] ?? null;
+            }
+
+            respondJson([
+                'ok' => true,
+                'attemptId' => $attemptId,
+                'completedAt' => $completedAt,
+                'recalibrated' => $recalibrated,
+                'plan' => $refreshedPlan,
+            ], 201);
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            respondJson([
+                'ok' => false,
+                'error' => 'Failed to persist recall attempt in MySQL.',
+                'details' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Action 6: delete_plan — POST fallback for hosts/WAFs that block HTTP DELETE
+    // -------------------------------------------------------------------------
+    if ($action === 'delete_plan') {
+        $planId = (int) ($body['planId'] ?? $_GET['plan_id'] ?? 0);
+        if ($planId <= 0) {
+            respondJson(['ok' => false, 'error' => 'Valid planId is required.'], 400);
+        }
+
+        $stmt = $pdo->prepare('DELETE FROM study_plans WHERE id = :id AND user_id = :uid');
+        $stmt->execute([':id' => $planId, ':uid' => $currentUserId]);
+
+        respondJson(['ok' => true, 'deletedPlanId' => $planId]);
+    }
+
     respondJson(['ok' => false, 'error' => "Unknown POST action: {$action}"], 400);
 }
 
@@ -373,16 +514,17 @@ if ($method === 'POST') {
 // =============================================================================
 if ($method === 'DELETE') {
     $pdo = getDbConnection();
+    $currentUser = resolveEffectiveUserRow($pdo, []);
+    $currentUserId = (int) $currentUser['id'];
     $planId = isset($_GET['plan_id']) ? (int) $_GET['plan_id'] : 0;
     if ($planId <= 0) {
         respondJson(['ok' => false, 'error' => 'Valid plan_id is required.'], 400);
     }
 
-    $stmt = $pdo->prepare('DELETE FROM study_plans WHERE id = :id');
-    $stmt->execute([':id' => $planId]);
+    $stmt = $pdo->prepare('DELETE FROM study_plans WHERE id = :id AND user_id = :uid');
+    $stmt->execute([':id' => $planId, ':uid' => $currentUserId]);
 
     respondJson(['ok' => true, 'deletedPlanId' => $planId]);
 }
 
 respondJson(['ok' => false, 'error' => 'Method not allowed.'], 405);
-

@@ -6,7 +6,8 @@ export const App: React.FC = () => {
   return (
     <BrowserRouter basename="/study">
       <Routes>
-        <Route path="/" element={<Dashboard />} />
+        <Route path="/" element={<Dashboard initialView="dashboard" />} />
+        <Route path="/about" element={<Dashboard initialView="about" />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

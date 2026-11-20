@@ -1,104 +1,330 @@
 import {
   GradeRecallEvaluation,
   ScheduledSessionBlueprint,
+  SessionPromptItem,
   StudyPlan,
   StudySession,
   StudyWindowConfig,
   UploadedFilePayload,
+  UserAccount,
 } from '../types/study';
 import {
   addCalendarDays,
   calculateSpacedSchedule,
+  CognitiveStageNumber,
+  diffCalendarDays,
   formatLocalDate,
+  normalizeStageName,
+  resolveStageNumber,
 } from '../utils/spacingEngine';
+import { requestGoogleOAuthToken } from '../utils/calendarSync';
 
 const API_BASE = '/study/api';
-const LOCAL_STORAGE_KEY = 'spaced_practice_ai_plans_v1';
+const LEGACY_STORAGE_KEY = 'spaced_practice_ai_plans_v1';
+const SEED_INITIALIZED_KEY = 'practice_buddy_seed_initialized_v1';
+const GUEST_TOKEN_KEY = 'pb_guest_token_v1';
+const AUTH_TOKEN_KEY = 'pb_auth_token_v1';
+const AUTH_USER_KEY = 'pb_auth_user_v1';
+const OFFLINE_USERS_KEY = 'pb_offline_accounts_v1';
 
-/**
- * Seed a realistic, evidence-based demo StudyPlan in localStorage so first-time visitors
- * or local Vite previews immediately see a rich schedule and can test the AI Recall Grader.
- */
+// -----------------------------------------------------------------------------
+// Guest Token & Auth Storage Helpers
+// -----------------------------------------------------------------------------
+function generateGuestToken(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return 'pb_g_' + crypto.randomUUID().replace(/-/g, '');
+    }
+  } catch {
+    // Fallback below
+  }
+  return (
+    'pb_g_' +
+    Math.random().toString(36).slice(2) +
+    Date.now().toString(36) +
+    Math.random().toString(36).slice(2)
+  );
+}
+
+export function getOrCreateLocalGuestToken(): string {
+  try {
+    const existing = localStorage.getItem(GUEST_TOKEN_KEY);
+    if (existing && existing.length >= 16) {
+      return existing;
+    }
+    const fresh = generateGuestToken();
+    localStorage.setItem(GUEST_TOKEN_KEY, fresh);
+    return fresh;
+  } catch {
+    return generateGuestToken();
+  }
+}
+
+export function getStoredAuthToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function getStoredUser(): UserAccount | null {
+  try {
+    const raw = localStorage.getItem(AUTH_USER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as UserAccount;
+    if (parsed && typeof parsed.id === 'number') {
+      return parsed;
+    }
+  } catch {
+    // Ignore
+  }
+  return null;
+}
+
+function saveStoredAuthSession(user: UserAccount, token?: string | null): void {
+  try {
+    localStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+    if (token) {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+    } else if (user.isGuest) {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+    if (user.isGuest && user.guestToken) {
+      localStorage.setItem(GUEST_TOKEN_KEY, user.guestToken);
+    }
+  } catch {
+    // Ignore quota errors
+  }
+}
+
+function buildAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const guestToken = getOrCreateLocalGuestToken();
+  if (guestToken) {
+    headers['X-Guest-Token'] = guestToken;
+  }
+  const authToken = getStoredAuthToken();
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+    headers['X-Auth-Token'] = authToken;
+  }
+  return headers;
+}
+
+function getPlansStorageKey(user?: UserAccount | null): string {
+  const active = user || getStoredUser();
+  if (active && !active.isGuest) {
+    return `pb_plans_user_${active.id}`;
+  }
+  const gt = active?.guestToken || getOrCreateLocalGuestToken();
+  return `pb_plans_guest_${gt}`;
+}
+
+function isSeedInitialized(scopeKey: string): boolean {
+  try {
+    return (
+      localStorage.getItem(`${SEED_INITIALIZED_KEY}_${scopeKey}`) === '1' ||
+      localStorage.getItem(SEED_INITIALIZED_KEY) === '1'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function markSeedInitialized(scopeKey: string): void {
+  try {
+    localStorage.setItem(`${SEED_INITIALIZED_KEY}_${scopeKey}`, '1');
+    localStorage.setItem(SEED_INITIALIZED_KEY, '1');
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function normalizePlanData(plan: StudyPlan): StudyPlan {
+  return {
+    ...plan,
+    sessions: (plan.sessions || []).map((s, idx) => {
+      const stageName = normalizeStageName(s.stageName || '');
+      const stageNumber = resolveStageNumber({
+        stageNumber: s.stageNumber,
+        stageName,
+        sessionNumber: s.sessionNumber || idx + 1,
+      });
+      const promptItems: SessionPromptItem[] =
+        Array.isArray(s.promptItems) && s.promptItems.length > 0
+          ? s.promptItems
+          : (s.prompts || []).map((p) => ({
+            prompt_text: p,
+            expected_rubric_points: [],
+          }));
+      return {
+        ...s,
+        stageNumber,
+        stageName,
+        promptItems,
+        prompts: promptItems.map((pi) => pi.prompt_text),
+      };
+    }),
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Seed Demo Plan & Stage-Specific Prompt Templates
+// -----------------------------------------------------------------------------
 function createDefaultSeedPlans(): StudyPlan[] {
   const today = formatLocalDate(new Date());
   const masterDate = addCalendarDays(today, 14);
   const schedule = calculateSpacedSchedule(today, masterDate);
 
-  const stagePrompts: Record<number, { prompts: string[]; checklist: string[] }> = {
+  const stageTemplates: Record<
+    number,
+    { promptItems: SessionPromptItem[]; checklist: string[] }
+  > = {
     1: {
-      prompts: [
-        'Without looking at notes, draw or describe the 4-stage pipeline of Cellular Respiration (Glycolysis → Pyruvate Oxidation → Citric Acid Cycle → Oxidative Phosphorylation) and state the exact cellular compartment for each.',
-        'How does the proton-motive force across the inner mitochondrial membrane couple the Electron Transport Chain (Complexes I–IV) to ATP Synthase rotary catalysis?',
-        'Contrast substrate-level phosphorylation with oxidative phosphorylation in terms of mechanism, oxygen dependency, and net ATP yield.',
+      promptItems: [
+        {
+          prompt_text:
+            'Map the 4-stage macro architecture of Cellular Respiration (Glycolysis -> Pyruvate Oxidation -> Citric Acid Cycle -> Oxidative Phosphorylation), grouping each stage by cellular compartment, primary inputs, and main outputs.',
+          expected_rubric_points: [
+            'Places Glycolysis in cytosol, Pyruvate oxidation & Citric Acid Cycle in mitochondrial matrix, and ETC in inner mitochondrial membrane',
+            'Connects pyruvate output from glycolysis to Acetyl-CoA entry in the matrix',
+            'Links NADH/FADH2 electron harvesting to oxidative phosphorylation',
+          ],
+        },
+        {
+          prompt_text:
+            'Trace how the Electron Transport Chain (Complexes I–IV) connects to ATP Synthase and distinguish substrate-level phosphorylation from oxidative phosphorylation at a high level.',
+          expected_rubric_points: [
+            'Explains proton pumping into intermembrane space creating proton-motive force',
+            'Identifies F0/F1 ATP Synthase chemiosmotic coupling and O2 as terminal acceptor',
+            'Contrasts direct enzymatic phosphate transfer with gradient-driven ATP synthesis',
+          ],
+        },
       ],
       checklist: [
-        'Correctly locates Glycolysis in cytosol, Pyruvate oxidation & Citric Acid Cycle in mitochondrial matrix, and ETC in cristae/inner mitochondrial membrane.',
-        'Explains NADH and FADH2 as high-energy electron donors driving proton pumping into the intermembrane space.',
+        'Correctly locates Glycolysis in cytosol, Pyruvate oxidation & Citric Acid Cycle in mitochondrial matrix, and ETC in inner mitochondrial membrane.',
+        'Explains NADH and FADH2 as electron donors driving proton pumping into the intermembrane space.',
         'Describes chemiosmosis via F0/F1 ATP Synthase and O2 as the terminal electron acceptor forming H2O.',
         'Distinguishes direct enzymatic phosphate transfer (substrate-level) from electrochemical gradient coupling.',
       ],
     },
     2: {
-      prompts: [
-        'Closed-Book Brain Dump: Write down every regulatory enzyme of Glycolysis and the Citric Acid Cycle you can recall, along with which molecules allosterically inhibit or activate them.',
-        'Retrieve from memory the exact net inputs and outputs of a single turn of the Citric Acid Cycle vs. two turns per glucose molecule.',
-        'What happens to the NADH/NAD+ ratio if Complex IV (Cytochrome c oxidase) is blocked by cyanide, and why does the Citric Acid Cycle halt even though it uses no O2 directly?',
+      promptItems: [
+        {
+          prompt_text:
+            'Closed-Book Free Recall: List every key regulatory enzyme of Glycolysis and the Citric Acid Cycle from memory, along with its allosteric activators and inhibitors.',
+          expected_rubric_points: [
+            'Identifies PFK-1 as committed pacemaker step inhibited by ATP/citrate and activated by AMP/Fructose-2,6-bisphosphate',
+            'Recalls Pyruvate Dehydrogenase and Isocitrate Dehydrogenase regulation',
+            'States exact net yield per glucose for Glycolysis and 2 turns of Citric Acid Cycle',
+          ],
+        },
+        {
+          prompt_text:
+            'Retrieve from memory the exact net inputs and outputs of two turns of the Citric Acid Cycle per glucose molecule, and state what happens to NAD+ if Complex IV is blocked.',
+          expected_rubric_points: [
+            'States 2 Acetyl-CoA yield 6 NADH, 2 FADH2, 2 GTP/ATP, and 4 CO2',
+            'Explains Complex IV blockade traps NADH/FADH2 in reduced state',
+            'Identifies NAD+ depletion halting Isocitrate and alpha-Ketoglutarate Dehydrogenases',
+          ],
+        },
       ],
       checklist: [
         'Identifies Phosphofructokinase-1 (PFK-1) as the committed pacemaker step inhibited by ATP/citrate and activated by AMP/Fructose-2,6-bisphosphate.',
         'States 2 Acetyl-CoA per glucose yield 6 NADH, 2 FADH2, 2 GTP/ATP, and 4 CO2.',
-        'Explains that Complex IV blockade traps electron carriers in reduced state (NADH/FADH2), depleting oxidized NAD+ required by Isocitrate Dehydrogenase and alpha-Ketoglutarate Dehydrogenase.',
+        'Explains that Complex IV blockade traps electron carriers in reduced state, depleting NAD+.',
       ],
     },
     3: {
-      prompts: [
-        'Elaborative Interrogation (WHY): Why does the cell invest 2 ATP during the preparatory phase of glycolysis before harvesting any energy, and how does hexokinase phosphorylation trap glucose inside the cell?',
-        'Elaborative Interrogation (HOW): How do brown adipose tissue uncoupling proteins (UCP1 / thermogenin) alter the relationship between oxygen consumption rate and ATP synthesis?',
-        'Why does FADH2 entering at Complex II yield ~1.5 ATP whereas NADH entering at Complex I yields ~2.5 ATP?',
+      promptItems: [
+        {
+          prompt_text:
+            'Why does the cell invest 2 ATP during the preparatory phase of glycolysis before harvesting energy, and how does hexokinase phosphorylation trap glucose inside the cell?',
+          expected_rubric_points: [
+            'Explains negative charge on Glucose-6-Phosphate prevents diffusion across lipid bilayer',
+            'Explains conformational/energetic priming destabilizes hexose ring for Aldolase cleavage',
+            'Contrasts hexokinase trapping with irreversible PFK-1 commitment',
+          ],
+        },
+        {
+          prompt_text:
+            'Why does FADH2 entering at Complex II yield ~1.5 ATP whereas NADH entering at Complex I yields ~2.5 ATP, and how does UCP1 alter oxygen consumption vs. ATP yield?',
+          expected_rubric_points: [
+            'Notes Complex II (Succinate Dehydrogenase) pumps 0 protons across inner membrane',
+            'Quantifies 10 H+ per NADH vs. 6 H+ per FADH2',
+            'Explains UCP1 dissipates proton gradient as heat, accelerating O2 consumption while dropping ATP output',
+          ],
+        },
       ],
       checklist: [
-        'Explains electrostatic trapping of negatively charged Glucose-6-Phosphate across the plasma membrane and destabilization of the hexose ring.',
-        'Explains that UCP1 dissipates the proton gradient as heat, causing maximal ETC electron flow and O2 consumption while ATP synthesis drops.',
-        'Notes that Complex II (Succinate Dehydrogenase) does not pump protons across the inner membrane, contributing fewer H+ per electron pair.',
+        'Explains electrostatic trapping of negatively charged Glucose-6-Phosphate and ring destabilization.',
+        'Explains that UCP1 dissipates the proton gradient as heat, maximizing O2 consumption while ATP drops.',
+        'Notes Complex II does not pump protons across the inner mitochondrial membrane.',
       ],
     },
     4: {
-      prompts: [
-        'Clinical Diagnostic Scenario: A patient presents with severe hyperthermia, profuse sweating, rapid breathing, and lactic acidosis after exposure to 2,4-Dinitrophenol (DNP). Diagnose the exact biochemical mechanism and predict their mitochondrial O2 consumption and ATP/ADP ratio.',
-        'Edge-Case Problem: Under anaerobic burst exercise in fast-twitch skeletal muscle, explain how lactate dehydrogenase (LDH) sustains glycolytic ATP production and how the Cori Cycle restores hepatic glucose.',
+      promptItems: [
+        {
+          prompt_text:
+            'Clinical Diagnostic Scenario: A patient presents with severe hyperthermia, profuse sweating, rapid breathing, and lactic acidosis after exposure to 2,4-Dinitrophenol (DNP). Diagnose the exact biochemical mechanism and predict mitochondrial O2 consumption and ATP/ADP ratio.',
+          expected_rubric_points: [
+            'Identifies DNP as a lipid-soluble protonophore collapsing the H+ electrochemical gradient',
+            'Predicts falling ATP/ADP ratio and loss of respiratory control',
+            'Explains runaway O2 consumption/heat generation plus compensatory anaerobic glycolysis causing lactic acidosis',
+          ],
+        },
+        {
+          prompt_text:
+            'Edge-Case Problem: Under anaerobic burst exercise in fast-twitch skeletal muscle, explain how lactate dehydrogenase (LDH) sustains glycolytic ATP production and how the Cori Cycle restores hepatic glucose.',
+          expected_rubric_points: [
+            'Explains LDH reduces pyruvate to lactate while oxidizing NADH back to NAD+',
+            'Identifies NAD+ regeneration as essential for GAPDH to keep glycolysis running',
+            'Describes Cori Cycle hepatic gluconeogenesis consuming ATP to recycle lactate',
+          ],
+        },
       ],
       checklist: [
-        'Identifies DNP as a lipid-soluble protonophore that shuttles H+ across the inner mitochondrial membrane, collapsing the electrochemical gradient.',
-        'Predicts plummeting ATP/ADP ratio, loss of respiratory control, runaway fuel oxidation, and compensatory anaerobic glycolysis causing lactic acidosis.',
-        'Explains that LDH oxidizes NADH back to NAD+ so Glyceraldehyde-3-phosphate dehydrogenase (GAPDH) can continue operating.',
+        'Identifies DNP as a protonophore collapsing the electrochemical gradient.',
+        'Predicts plummeting ATP/ADP ratio, runaway O2 consumption, and lactic acidosis.',
+        'Explains LDH oxidizes NADH back to NAD+ so GAPDH continues operating.',
       ],
     },
     5: {
-      prompts: [
-        'Feynman Teach-Back Mastery Verification: Imagine teaching an inquisitive 14-year-old how a single glucose molecule powers their heartbeat. Explain the entire journey from cytosolic splitting to the molecular waterwheel (ATP Synthase) without hiding behind unexplained jargon.',
-        'Self-Audit: Explicitly explain the feedback loops that slow down cellular respiration when the cell is resting with abundant ATP.',
+      promptItems: [
+        {
+          prompt_text:
+            'Mastery Synthesis Challenge: Teach the complete story of how one glucose molecule powers a heartbeat—integrating compartmentalized stages, electron shuttles, proton-motive catalysis, and allosteric feedback homeostasis—in clear, rigorous language.',
+          expected_rubric_points: [
+            'Integrates all 4 stages across cytosol, matrix, and inner membrane seamlessly',
+            'Explains electron carrier harvesting, proton-motive force, and ATP Synthase rotary mechanism',
+            'Covers allosteric feedback inhibition of PFK-1, PDH, and Isocitrate Dehydrogenase at high ATP/NADH',
+          ],
+        },
       ],
       checklist: [
-        'Uses clear, mechanistic analogies while preserving biochemical accuracy (cytosol vs. matrix vs. intermembrane space).',
-        'Clearly explains electron harvesting (NADH/FADH2), proton gradient buildup, and chemiosmotic ATP synthesis.',
-        'Covers allosteric feedback inhibition of PFK-1, Pyruvate Dehydrogenase, and Isocitrate Dehydrogenase by high ATP/NADH.',
+        'Uses clear, mechanistic synthesis while preserving biochemical accuracy across compartments.',
+        'Explains electron harvesting (NADH/FADH2), proton gradient buildup, and chemiosmotic ATP synthesis.',
+        'Covers allosteric feedback inhibition of PFK-1, Pyruvate Dehydrogenase, and Isocitrate Dehydrogenase.',
       ],
     },
   };
 
   const sessions: StudySession[] = schedule.sessions.map((bp, idx) => {
-    const template = stagePrompts[idx + 1] || stagePrompts[5];
+    const template = stageTemplates[bp.stageNumber] || stageTemplates[5];
     const isFirstCompleted = idx === 0;
     return {
       id: 100 + idx + 1,
       planId: 1,
       sessionNumber: bp.sessionNumber,
+      stageNumber: bp.stageNumber,
       stageName: bp.stageName,
       scheduledDate: bp.scheduledDate,
       dayOffset: bp.dayOffset,
       gapDays: bp.gapDays,
       cognitiveGoal: bp.cognitiveGoal,
-      prompts: template.prompts,
+      prompts: template.promptItems.map((p) => p.prompt_text),
+      promptItems: template.promptItems,
       verificationChecklist: template.checklist,
       status: isFirstCompleted ? 'completed' : 'pending',
       masteryScore: isFirstCompleted ? 91 : null,
@@ -106,27 +332,36 @@ function createDefaultSeedPlans(): StudyPlan[] {
       completedAt: isFirstCompleted ? `${today} 10:15:00` : null,
       attempts: isFirstCompleted
         ? [
-            {
-              id: 501,
-              sessionId: 101,
-              userResponseText:
-                'Cellular respiration proceeds through four coupled stages: (1) Glycolysis in the cytosol converts 1 glucose into 2 pyruvate, 2 net ATP (via substrate-level phosphorylation), and 2 NADH. (2) Pyruvate oxidation in the mitochondrial matrix uses the Pyruvate Dehydrogenase Complex to decarboxylate pyruvate into Acetyl-CoA, releasing CO2 and reducing NAD+ to NADH. (3) The Citric Acid Cycle in the matrix oxidizes Acetyl-CoA to 2 CO2 per turn while generating 3 NADH, 1 FADH2, and 1 GTP. (4) Oxidative phosphorylation across the inner mitochondrial membrane uses Complexes I, III, and IV to pump protons into the intermembrane space as electrons flow to terminal acceptor O2, and F0F1 ATP Synthase uses the resulting proton-motive force to synthesize ~26-28 ATP.',
-              aiScore: 91,
-              strengths: [
-                'Accurate compartmentalization across cytosol, mitochondrial matrix, and inner mitochondrial membrane.',
-                'Clear distinction between substrate-level phosphorylation and chemiosmotic oxidative phosphorylation.',
-                'Precise accounting of electron carriers (NADH, FADH2) and terminal electron acceptor O2.',
-              ],
-              missingConcepts: [
-                'Could explicitly note that Complex II (Succinate Dehydrogenase) transfers electrons from FADH2 via ubiquinone without pumping protons.',
-              ],
-              correctiveFeedback:
-                'Outstanding initial schema map! Your structural trace from cytosolic glycolysis to rotary catalysis at F0F1 ATP Synthase is rock-solid. To reach 100%, explicitly incorporate why FADH2 yields fewer ATP than NADH (Complex II bypasses Complex I proton translocation).',
-              followUpQuestion:
-                'How does cytosolic NADH produced during glycolysis transfer its reducing equivalents into the mitochondrial matrix in heart/liver cells versus skeletal muscle cells?',
-              createdAt: `${today} 10:15:00`,
-            },
-          ]
+          {
+            id: 501,
+            sessionId: 101,
+            userResponseText:
+              'Cellular respiration proceeds through four coupled stages: (1) Glycolysis in the cytosol converts 1 glucose into 2 pyruvate, 2 net ATP (via substrate-level phosphorylation), and 2 NADH. (2) Pyruvate oxidation in the mitochondrial matrix uses the Pyruvate Dehydrogenase Complex to convert pyruvate into Acetyl-CoA, releasing CO2 and NADH. (3) The Citric Acid Cycle in the matrix oxidizes Acetyl-CoA to CO2 while generating NADH, FADH2, and GTP. (4) Oxidative phosphorylation across the inner mitochondrial membrane uses Complexes I, III, and IV to pump protons into the intermembrane space as electrons flow to terminal acceptor O2, and F0F1 ATP Synthase uses the resulting proton-motive force to synthesize ~26-28 ATP.',
+            aiScore: 91,
+            strengths: [
+              'Accurate compartmentalization across cytosol, mitochondrial matrix, and inner mitochondrial membrane.',
+              'Clear distinction between substrate-level phosphorylation and chemiosmotic oxidative phosphorylation.',
+              'Precise accounting of electron carriers (NADH, FADH2) and terminal electron acceptor O2.',
+            ],
+            whatYouNailed: [
+              'Accurate compartmentalization across cytosol, mitochondrial matrix, and inner mitochondrial membrane.',
+              'Clear distinction between substrate-level phosphorylation and chemiosmotic oxidative phosphorylation.',
+            ],
+            cognitiveStageCheck:
+              'Stage 1 Check Passed: You mapped the 4-stage architecture, cellular compartments, and primary structural connections cleanly.',
+            missingConcepts: [
+              'Explicitly note that Complex II (Succinate Dehydrogenase) transfers electrons from FADH2 via ubiquinone without pumping protons.',
+            ],
+            missingToReview: [
+              'Explicitly note that Complex II (Succinate Dehydrogenase) transfers electrons from FADH2 via ubiquinone without pumping protons.',
+            ],
+            correctiveFeedback:
+              'Outstanding initial schema map! Your structural trace from cytosolic glycolysis to rotary catalysis at F0F1 ATP Synthase is rock-solid.',
+            followUpQuestion:
+              'How does cytosolic NADH produced during glycolysis transfer its reducing equivalents into the mitochondrial matrix in heart/liver cells versus skeletal muscle cells?',
+            createdAt: `${today} 10:15:00`,
+          },
+        ]
         : [],
     };
   });
@@ -181,12 +416,11 @@ function createDefaultSeedPlans(): StudyPlan[] {
       ],
       extractedContextCache:
         'AUTHORITATIVE SOURCE DIGEST — BIOENERGETICS & CELLULAR RESPIRATION:\n' +
-        '1. Overview & Compartmentalization: Aerobic oxidation of glucose (C6H12O6 + 6 O2 -> 6 CO2 + 6 H2O, ΔG°\' = -2870 kJ/mol) captures energy in ~30-32 ATP molecules per glucose.\n' +
-        '2. Stage 1 — Glycolysis (Cytosol): Investment of 2 ATP at Hexokinase and Phosphofructokinase-1 (PFK-1); Cleavage by Aldolase into DHAP and G3P; Payoff phase via GAPDH (producing 2 NADH) and substrate-level phosphorylation at Phosphoglycerate Kinase (2 ATP) and Pyruvate Kinase (2 ATP). Net yield: 2 Pyruvate, 2 ATP, 2 NADH. PFK-1 is the committed step: inhibited by high ATP and Citrate; activated by AMP, ADP, and Fructose-2,6-bisphosphate.\n' +
-        '3. Stage 2 — Pyruvate Oxidation (Mitochondrial Matrix): Pyruvate enters via Mitochondrial Pyruvate Carrier (MPC). Pyruvate Dehydrogenase Complex (PDC, requiring TPP, lipoamide, CoA, FAD, NAD+) catalyzes oxidative decarboxylation of 2 Pyruvate -> 2 Acetyl-CoA + 2 CO2 + 2 NADH.\n' +
-        '4. Stage 3 — Citric Acid Cycle / Krebs Cycle (Mitochondrial Matrix): Citrate Synthase condenses Acetyl-CoA (2C) + Oxaloacetate (4C) -> Citrate (6C). Isocitrate Dehydrogenase and alpha-Ketoglutarate Dehydrogenase catalyze oxidative decarboxylations producing NADH and CO2. Succinyl-CoA Synthetase produces GTP (substrate-level phosphorylation). Succinate Dehydrogenase (Complex II, embedded in inner membrane) oxidizes succinate to fumarate producing FADH2. Malate Dehydrogenase regenerates Oxaloacetate and produces NADH. Per glucose (2 turns): 6 NADH, 2 FADH2, 2 GTP/ATP, 4 CO2.\n' +
-        '5. Stage 4 — Oxidative Phosphorylation (Inner Mitochondrial Membrane): NADH donates 2e- to Complex I (NADH:ubiquinone oxidoreductase, pumps 4 H+). FADH2 donates 2e- via Complex II to Ubiquinone (CoQ) with 0 H+ pumped. Complex III (Cytochrome bc1, Q-cycle) transfers e- to Cytochrome c and pumps 4 H+. Complex IV (Cytochrome c oxidase) reduces 1/2 O2 + 2H+ -> H2O and pumps 2 H+. Total H+ pumped: 10 H+ per NADH (~2.5 ATP), 6 H+ per FADH2 (~1.5 ATP). F0F1 ATP Synthase uses proton flux down electrochemical gradient (chemiosmosis) to phosphorylate ADP + Pi -> ATP.\n' +
-        '6. Uncouplers & Inhibitors: Protonophores (2,4-DNP) and UCP1 (thermogenin in brown fat) permeabilize the inner membrane to H+, collapsing Δp, halting ATP synthesis while accelerating electron transport, O2 consumption, and heat dissipation. Cyanide/CO inhibit Complex IV, halting electron flow, collapsing proton pumping, and trapping NADH so the Citric Acid Cycle arrests from NAD+ depletion.',
+        '1. Overview & Compartmentalization: Aerobic oxidation of glucose captures energy in ~30-32 ATP molecules per glucose across cytosol, matrix, and inner mitochondrial membrane.\n' +
+        '2. Glycolysis (Cytosol): Investment of 2 ATP at Hexokinase and PFK-1; Payoff phase via GAPDH (2 NADH) and substrate-level phosphorylation (4 ATP gross, 2 net). PFK-1 is inhibited by ATP/citrate and activated by AMP/Fructose-2,6-bisphosphate.\n' +
+        '3. Pyruvate Oxidation & Citric Acid Cycle (Matrix): PDC oxidizes 2 Pyruvate -> 2 Acetyl-CoA + 2 CO2 + 2 NADH. Two turns of the Citric Acid Cycle yield 6 NADH, 2 FADH2, 2 GTP/ATP, and 4 CO2.\n' +
+        '4. Oxidative Phosphorylation (Inner Membrane): Complex I pumps 4 H+, Complex II (FADH2) pumps 0 H+, Complex III pumps 4 H+, Complex IV reduces O2 to H2O and pumps 2 H+. Proton flux powers F0F1 ATP Synthase.\n' +
+        '5. Uncouplers & Inhibitors: 2,4-DNP and UCP1 collapse the proton gradient, halting ATP synthesis while increasing O2 consumption and heat; cyanide blocks Complex IV.',
       startDate: today,
       masterByDate: masterDate,
       createdAt: `${today} 09:00:00`,
@@ -201,83 +435,547 @@ function createDefaultSeedPlans(): StudyPlan[] {
   ];
 }
 
-function loadLocalPlans(): StudyPlan[] {
+function loadLocalPlans(user?: UserAccount | null): StudyPlan[] {
+  const activeUser = user || getStoredUser();
+  const key = getPlansStorageKey(activeUser);
+
   try {
-    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-    if (!raw) {
-      const seeded = createDefaultSeedPlans();
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(seeded));
-      return seeded;
+    let raw = localStorage.getItem(key);
+    // Migrate legacy single-user storage on guest load if present
+    if (raw === null && (!activeUser || activeUser.isGuest)) {
+      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacy !== null) {
+        raw = legacy;
+        localStorage.setItem(key, legacy);
+      }
     }
+
+    if (raw === null) {
+      if (!isSeedInitialized(key) && (!activeUser || activeUser.isGuest)) {
+        const seeded = createDefaultSeedPlans();
+        saveLocalPlans(seeded, activeUser);
+        markSeedInitialized(key);
+        return seeded;
+      }
+      return [];
+    }
+
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length > 0
-      ? parsed
-      : createDefaultSeedPlans();
+    return Array.isArray(parsed)
+      ? (parsed as StudyPlan[]).map(normalizePlanData)
+      : [];
   } catch {
-    return createDefaultSeedPlans();
+    return isSeedInitialized(key) ? [] : createDefaultSeedPlans();
   }
 }
 
-function saveLocalPlans(plans: StudyPlan[]): void {
+function saveLocalPlans(plans: StudyPlan[], user?: UserAccount | null): void {
+  const key = getPlansStorageKey(user);
   try {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(plans));
+    localStorage.setItem(key, JSON.stringify(plans.map(normalizePlanData)));
   } catch {
     // Ignore storage quota errors
   }
 }
 
-export interface ApiInitData {
-  plans: StudyPlan[];
-  backendLive: boolean;
-  googleOAuthClientId: string;
-  geminiModel: string;
+function migrateLocalGuestPlans(
+  guestToken: string,
+  targetUser: UserAccount
+): number {
+  const guestKey = `pb_plans_guest_${guestToken}`;
+  const targetKey = getPlansStorageKey(targetUser);
+  if (guestKey === targetKey) return 0;
+
+  try {
+    const rawGuest = localStorage.getItem(guestKey);
+    if (!rawGuest) return 0;
+    const guestPlans = JSON.parse(rawGuest) as StudyPlan[];
+    if (!Array.isArray(guestPlans) || guestPlans.length === 0) return 0;
+
+    const rawTarget = localStorage.getItem(targetKey);
+    const existingTarget = rawTarget
+      ? (JSON.parse(rawTarget) as StudyPlan[])
+      : [];
+    const seen = new Set(existingTarget.map((p) => `${p.topicTitle}::${p.startDate}`));
+
+    const migrated = guestPlans
+      .filter((gp) => !seen.has(`${gp.topicTitle}::${gp.startDate}`))
+      .map((gp) => ({
+        ...gp,
+        userId: targetUser.id,
+        userEmail: targetUser.email || gp.userEmail,
+      }));
+
+    const combined = [...migrated, ...existingTarget];
+    localStorage.setItem(targetKey, JSON.stringify(combined.map(normalizePlanData)));
+    localStorage.removeItem(guestKey);
+    return migrated.length;
+  } catch {
+    return 0;
+  }
 }
 
-/**
- * Fetch all study plans from Hostinger MySQL (`/study/api/plans.php`),
- * falling back cleanly to local storage when running without a PHP/MySQL backend.
- */
-export async function fetchAllPlans(): Promise<ApiInitData> {
+// -----------------------------------------------------------------------------
+// Offline Auth Fallback (when running Vite preview without PHP/MySQL)
+// -----------------------------------------------------------------------------
+interface OfflineAccountRecord {
+  id: number;
+  email: string;
+  password: string;
+  displayName: string;
+}
+
+function loadOfflineAccounts(): OfflineAccountRecord[] {
   try {
-    const res = await fetch(`${API_BASE}/plans.php`, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
+    const raw = localStorage.getItem(OFFLINE_USERS_KEY);
+    return raw ? (JSON.parse(raw) as OfflineAccountRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveOfflineAccounts(accounts: OfflineAccountRecord[]): void {
+  try {
+    localStorage.setItem(OFFLINE_USERS_KEY, JSON.stringify(accounts));
+  } catch {
+    // Ignore
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Auth API Operations (`/study/api/auth.php`)
+// -----------------------------------------------------------------------------
+export async function ensureAuthSession(): Promise<UserAccount> {
+  const guestToken = getOrCreateLocalGuestToken();
+  const storedUser = getStoredUser();
+
+  try {
+    const res = await fetch(
+      `${API_BASE}/auth.php?guest_token=${encodeURIComponent(guestToken)}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...buildAuthHeaders(),
+        },
+      }
+    );
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && ct.includes('application/json')) {
+      const data = await res.json();
+      if (data.ok && data.user) {
+        const user = data.user as UserAccount;
+        saveStoredAuthSession(user, data.token || null);
+        return user;
+      }
+    }
+  } catch {
+    // Offline local preview fallback
+  }
+
+  if (storedUser) {
+    return storedUser;
+  }
+
+  const guestUser: UserAccount = {
+    id: 0,
+    email: null,
+    displayName: 'Guest Mode',
+    isGuest: true,
+    guestToken,
+  };
+  saveStoredAuthSession(guestUser, null);
+  return guestUser;
+}
+
+export async function continueAsGuest(): Promise<UserAccount> {
+  const guestToken = getOrCreateLocalGuestToken();
+  try {
+    const res = await fetch(`${API_BASE}/auth.php?action=guest`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({ action: 'guest', guestToken }),
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && ct.includes('application/json')) {
+      const data = await res.json();
+      if (data.ok && data.user) {
+        const user = data.user as UserAccount;
+        saveStoredAuthSession(user, data.token || null);
+        return user;
+      }
+    }
+  } catch {
+    // Offline fallback
+  }
+
+  const guestUser: UserAccount = {
+    id: 0,
+    email: null,
+    displayName: 'Guest Mode',
+    isGuest: true,
+    guestToken,
+  };
+  saveStoredAuthSession(guestUser, null);
+  return guestUser;
+}
+
+export async function registerWithEmail(params: {
+  displayName: string;
+  email: string;
+  password: string;
+}): Promise<{ user: UserAccount; migratedPlansCount: number }> {
+  const guestToken = getOrCreateLocalGuestToken();
+  const currentUser = getStoredUser();
+  const localGuestPlans =
+    currentUser?.isGuest !== false ? loadLocalPlans(currentUser) : [];
+
+  try {
+    const res = await fetch(`${API_BASE}/auth.php?action=register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({
+        action: 'register',
+        displayName: params.displayName,
+        email: params.email,
+        password: params.password,
+        guestToken,
+        localPlans: localGuestPlans,
+      }),
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Could not create account.');
+      }
+      const user = data.user as UserAccount;
+      saveStoredAuthSession(user, data.token);
+      const localMig = migrateLocalGuestPlans(guestToken, user);
+      return {
+        user,
+        migratedPlansCount: Number(data.migratedPlansCount || localMig || 0),
+      };
+    }
+  } catch (err) {
+    if (err instanceof Error && !/fetch|network|json/i.test(err.message)) {
+      throw err;
+    }
+  }
+
+  // Offline dev preview fallback
+  const accounts = loadOfflineAccounts();
+  const normalizedEmail = params.email.trim().toLowerCase();
+  if (accounts.some((a) => a.email === normalizedEmail)) {
+    throw new Error('An account with this email already exists. Please sign in instead.');
+  }
+  const created: OfflineAccountRecord = {
+    id: Date.now(),
+    email: normalizedEmail,
+    password: params.password,
+    displayName: params.displayName.trim() || normalizedEmail.split('@')[0],
+  };
+  saveOfflineAccounts([...accounts, created]);
+  const user: UserAccount = {
+    id: created.id,
+    email: created.email,
+    displayName: created.displayName,
+    isGuest: false,
+  };
+  saveStoredAuthSession(user, `offline_${created.id}`);
+  const migratedPlansCount = migrateLocalGuestPlans(guestToken, user);
+  return { user, migratedPlansCount };
+}
+
+export async function loginWithEmail(params: {
+  email: string;
+  password: string;
+}): Promise<{ user: UserAccount; migratedPlansCount: number }> {
+  const guestToken = getOrCreateLocalGuestToken();
+  const currentUser = getStoredUser();
+  const localGuestPlans =
+    currentUser?.isGuest !== false ? loadLocalPlans(currentUser) : [];
+
+  try {
+    const res = await fetch(`${API_BASE}/auth.php?action=login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({
+        action: 'login',
+        email: params.email,
+        password: params.password,
+        guestToken,
+        localPlans: localGuestPlans,
+      }),
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Invalid email or password.');
+      }
+      const user = data.user as UserAccount;
+      saveStoredAuthSession(user, data.token);
+      const localMig = migrateLocalGuestPlans(guestToken, user);
+      return {
+        user,
+        migratedPlansCount: Number(data.migratedPlansCount || localMig || 0),
+      };
+    }
+  } catch (err) {
+    if (err instanceof Error && !/fetch|network|json/i.test(err.message)) {
+      throw err;
+    }
+  }
+
+  // Offline dev preview fallback
+  const accounts = loadOfflineAccounts();
+  const normalizedEmail = params.email.trim().toLowerCase();
+  const match = accounts.find(
+    (a) => a.email === normalizedEmail && a.password === params.password
+  );
+  if (!match) {
+    throw new Error('Invalid email or password.');
+  }
+  const user: UserAccount = {
+    id: match.id,
+    email: match.email,
+    displayName: match.displayName,
+    isGuest: false,
+  };
+  saveStoredAuthSession(user, `offline_${match.id}`);
+  const migratedPlansCount = migrateLocalGuestPlans(guestToken, user);
+  return { user, migratedPlansCount };
+}
+
+export async function authenticateWithGoogle(
+  googleClientId: string
+): Promise<{ user: UserAccount; migratedPlansCount: number }> {
+  const accessToken = await requestGoogleOAuthToken(googleClientId, [
+    'openid',
+    'email',
+    'profile',
+  ]);
+
+  const guestToken = getOrCreateLocalGuestToken();
+  const currentUser = getStoredUser();
+  const localGuestPlans =
+    currentUser?.isGuest !== false ? loadLocalPlans(currentUser) : [];
+
+  const res = await fetch(`${API_BASE}/auth.php?action=google`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildAuthHeaders(),
+    },
+    body: JSON.stringify({
+      action: 'google',
+      accessToken,
+      guestToken,
+      localPlans: localGuestPlans,
+    }),
+  });
+
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || 'Google Sign-In verification failed.');
+    }
+    const user = data.user as UserAccount;
+    saveStoredAuthSession(user, data.token);
+    const localMig = migrateLocalGuestPlans(guestToken, user);
+    return {
+      user,
+      migratedPlansCount: Number(data.migratedPlansCount || localMig || 0),
+    };
+  }
+
+  throw new Error('Could not reach Practice Buddy authentication endpoint.');
+}
+
+export async function logoutUser(): Promise<UserAccount> {
+  try {
+    await fetch(`${API_BASE}/auth.php?action=logout`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({ action: 'logout' }),
+    });
+  } catch {
+    // Ignore offline logout
+  }
+
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_USER_KEY);
+    // Assign a fresh guest token on explicit sign-out so signed-in data stays isolated
+    const nextGuestToken = generateGuestToken();
+    localStorage.setItem(GUEST_TOKEN_KEY, nextGuestToken);
+  } catch {
+    // Ignore
+  }
+
+  return continueAsGuest();
+}
+
+// -----------------------------------------------------------------------------
+// Study Plans CRUD & Rescheduling
+// -----------------------------------------------------------------------------
+async function persistPlanDirectToMySql(
+  plan: Omit<StudyPlan, 'id'> | StudyPlan,
+  user?: UserAccount | null
+): Promise<StudyPlan | null> {
+  try {
+    const res = await fetch(`${API_BASE}/plans.php?action=create_plan`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({
+        userEmail: user?.email || plan.userEmail || 'learner@english-3d.com',
+        guestToken: getOrCreateLocalGuestToken(),
+        topicTitle: plan.topicTitle,
+        executiveSummary: plan.executiveSummary,
+        coreConcepts: plan.coreConcepts,
+        sourceLinks: plan.sourceLinks,
+        extractedContextCache: plan.extractedContextCache,
+        startDate: plan.startDate,
+        masterByDate: plan.masterByDate,
+        sessions: plan.sessions,
+      }),
     });
     const contentType = res.headers.get('content-type') || '';
     if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
+      if (data.ok && data.plan) {
+        return normalizePlanData({
+          ...(data.plan as StudyPlan),
+          studyWindow: plan.studyWindow,
+        });
+      }
+    }
+  } catch {
+    // MySQL endpoint unreachable
+  }
+  return null;
+}
+
+export interface ApiInitData {
+  plans: StudyPlan[];
+  backendLive: boolean;
+  backendError?: string;
+  googleOAuthClientId: string;
+  geminiModel: string;
+  user: UserAccount;
+}
+
+export async function fetchAllPlans(
+  activeUser?: UserAccount | null
+): Promise<ApiInitData> {
+  let backendError: string | undefined;
+  const resolvedUser = activeUser || (await ensureAuthSession());
+  const scopeKey = getPlansStorageKey(resolvedUser);
+
+  try {
+    const guestToken = getOrCreateLocalGuestToken();
+    const res = await fetch(
+      `${API_BASE}/plans.php?guest_token=${encodeURIComponent(guestToken)}`,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...buildAuthHeaders(),
+        },
+      }
+    );
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
+      const data = await res.json();
       if (data.ok && Array.isArray(data.plans)) {
-        const localPlans = loadLocalPlans();
-        const merged =
-          data.plans.length > 0 ? (data.plans as StudyPlan[]) : localPlans;
-        saveLocalPlans(merged);
+        const serverUser: UserAccount = data.user || resolvedUser;
+        if (data.user) {
+          saveStoredAuthSession(serverUser, getStoredAuthToken());
+        }
+
+        let plans = (data.plans as StudyPlan[]).map(normalizePlanData);
+
+        if (plans.length > 0) {
+          markSeedInitialized(scopeKey);
+        } else {
+          let hasLocalKey = false;
+          try {
+            hasLocalKey = localStorage.getItem(scopeKey) !== null;
+          } catch {
+            hasLocalKey = false;
+          }
+          if (!isSeedInitialized(scopeKey) && !hasLocalKey && serverUser.isGuest) {
+            const [seedPlan] = createDefaultSeedPlans();
+            const persistedSeed = await persistPlanDirectToMySql(seedPlan, serverUser);
+            plans = persistedSeed ? [persistedSeed] : [seedPlan];
+          }
+          markSeedInitialized(scopeKey);
+        }
+
+        saveLocalPlans(plans, serverUser);
         return {
-          plans: merged,
+          plans,
           backendLive: true,
           googleOAuthClientId:
             data.config?.googleOAuthClientId ||
             localStorage.getItem('sp_google_client_id') ||
             '',
           geminiModel: data.config?.geminiModel || 'gemini-3.8-flash',
+          user: serverUser,
         };
       }
+      backendError = data.details || data.error || 'Invalid response from MySQL API.';
+    } else if (contentType.includes('application/json')) {
+      const errData = await res.json().catch(() => null);
+      backendError =
+        errData?.details ||
+        errData?.error ||
+        `MySQL backend error (HTTP ${res.status}).`;
+    } else if (
+      res.status >= 500 ||
+      (!res.ok &&
+        window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1')
+    ) {
+      backendError = `MySQL backend returned HTTP ${res.status} at ${API_BASE}/plans.php.`;
     }
-  } catch {
-    // Backend PHP/MySQL is offline in local Vite preview
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      window.location.hostname !== 'localhost' &&
+      window.location.hostname !== '127.0.0.1'
+    ) {
+      backendError = `Could not reach ${API_BASE}/plans.php: ${err.message}`;
+    }
   }
 
   return {
-    plans: loadLocalPlans(),
+    plans: loadLocalPlans(resolvedUser),
     backendLive: false,
+    backendError,
     googleOAuthClientId: localStorage.getItem('sp_google_client_id') || '',
     geminiModel: 'gemini-3.8-flash',
+    user: resolvedUser,
   };
 }
 
-/**
- * Generate a cognitive-scaffolded Spaced Study Plan via `/study/api/gemini.php?action=generate_plan`
- * and store it in MySQL (`study_plans` + `study_sessions`).
- */
 export async function generateAndSaveStudyPlan(params: {
   topicPrompt: string;
   urls: string[];
@@ -287,11 +985,20 @@ export async function generateAndSaveStudyPlan(params: {
   scheduledBlueprints: ScheduledSessionBlueprint[];
   studyWindow: StudyWindowConfig;
   userEmail?: string;
-}): Promise<{ plan: StudyPlan; persistedInMySql: boolean }> {
+  user?: UserAccount | null;
+}): Promise<{ plan: StudyPlan; persistedInMySql: boolean; warning?: string }> {
+  let candidatePlan: StudyPlan | null = null;
+  let persistedInMySql = false;
+  let warning: string | undefined;
+  const activeUser = params.user || getStoredUser();
+
   try {
     const res = await fetch(`${API_BASE}/gemini.php?action=generate_plan`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
       body: JSON.stringify({
         action: 'generate_plan',
         topicPrompt: params.topicPrompt,
@@ -300,7 +1007,8 @@ export async function generateAndSaveStudyPlan(params: {
         startDate: params.startDate,
         masterByDate: params.masterByDate,
         scheduledBlueprints: params.scheduledBlueprints,
-        userEmail: params.userEmail || 'learner@english-3d.com',
+        userEmail: activeUser?.email || params.userEmail || 'learner@english-3d.com',
+        guestToken: getOrCreateLocalGuestToken(),
         saveToDb: true,
       }),
     });
@@ -309,52 +1017,186 @@ export async function generateAndSaveStudyPlan(params: {
     if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
       if (data.ok && data.plan) {
-        const createdPlan: StudyPlan = {
+        persistedInMySql = Boolean(
+          data.persistedInMySql && data.plan.id && !data.plan.dbWarning
+        );
+        if (data.aiWarning) {
+          warning = String(data.aiWarning);
+        } else if (data.plan.dbWarning) {
+          warning = String(data.plan.dbWarning);
+        }
+        candidatePlan = normalizePlanData({
           ...data.plan,
           id: data.plan.id || Date.now(),
           createdAt: data.plan.createdAt || new Date().toISOString(),
           studyWindow: params.studyWindow,
-        };
-        const current = loadLocalPlans();
-        saveLocalPlans([createdPlan, ...current]);
-        return { plan: createdPlan, persistedInMySql: !data.plan.dbWarning };
+        });
       }
     }
   } catch {
     // Fallback to client-side synthesized plan when PHP proxy is unreachable
   }
 
-  // Synthesize an evidence-based plan locally so user workflow always succeeds
-  const synthesized = buildSynthesizedPlanFallback(params);
-  const current = loadLocalPlans();
-  saveLocalPlans([synthesized, ...current]);
-  return { plan: synthesized, persistedInMySql: false };
+  if (!candidatePlan) {
+    candidatePlan = buildSynthesizedPlanFallback({
+      ...params,
+      userEmail: activeUser?.email || params.userEmail,
+    });
+  }
+
+  if (!persistedInMySql) {
+    const persisted = await persistPlanDirectToMySql(candidatePlan, activeUser);
+    if (persisted) {
+      candidatePlan = persisted;
+      persistedInMySql = true;
+    } else {
+      warning =
+        warning ||
+        'Saved in browser cache only because Hostinger MySQL could not be reached.';
+    }
+  }
+
+  const scopeKey = getPlansStorageKey(activeUser);
+  markSeedInitialized(scopeKey);
+  const current = loadLocalPlans(activeUser).filter((p) => p.id !== candidatePlan!.id);
+  saveLocalPlans([candidatePlan, ...current], activeUser);
+  return { plan: candidatePlan, persistedInMySql, warning };
 }
 
-/**
- * Grade an Active-Recall or Feynman Teach-Back attempt via `POST /study/api/gemini.php?action=grade_recall`.
- */
+export async function rescheduleOverdueSession(params: {
+  plan: StudyPlan;
+  session: StudySession;
+  cascadeRemaining?: boolean;
+  user?: UserAccount | null;
+}): Promise<{ updatedPlan: StudyPlan; shiftedCount: number }> {
+  const today = formatLocalDate(new Date());
+  const cascade = params.cascadeRemaining !== false;
+  const activeUser = params.user || getStoredUser();
+
+  try {
+    const res = await fetch(`${API_BASE}/plans.php?action=reschedule_session`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
+      body: JSON.stringify({
+        action: 'reschedule_session',
+        sessionId: params.session.id,
+        newScheduledDate: today,
+        cascadeRemaining: cascade,
+      }),
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && ct.includes('application/json')) {
+      const data = await res.json();
+      if (data.ok && data.plan) {
+        const updatedPlan = normalizePlanData({
+          ...(data.plan as StudyPlan),
+          studyWindow: params.plan.studyWindow,
+        });
+        const plans = loadLocalPlans(activeUser).map((p) =>
+          p.id === updatedPlan.id ? updatedPlan : p
+        );
+        saveLocalPlans(plans, activeUser);
+        return {
+          updatedPlan,
+          shiftedCount: Number(data.shiftedCount || 1),
+        };
+      }
+    }
+  } catch {
+    // Fallback to local schedule shifting
+  }
+
+  const deltaDays = Math.max(
+    0,
+    diffCalendarDays(params.session.scheduledDate, today)
+  );
+  let prevDate = today;
+  let shiftedCount = 0;
+  let latestDate = params.plan.masterByDate;
+
+  const updatedSessions = params.plan.sessions.map((s) => {
+    if (s.id === params.session.id) {
+      shiftedCount++;
+      if (today > latestDate) latestDate = today;
+      return {
+        ...s,
+        scheduledDate: today,
+        dayOffset: Math.max(0, diffCalendarDays(params.plan.startDate, today)),
+      };
+    }
+
+    if (
+      cascade &&
+      deltaDays > 0 &&
+      s.status !== 'completed' &&
+      s.sessionNumber > params.session.sessionNumber
+    ) {
+      let nextDate = addCalendarDays(s.scheduledDate, deltaDays);
+      if (nextDate <= prevDate) {
+        nextDate = addCalendarDays(prevDate, Math.max(1, s.gapDays || 1));
+      }
+      prevDate = nextDate;
+      shiftedCount++;
+      if (nextDate > latestDate) latestDate = nextDate;
+      return {
+        ...s,
+        scheduledDate: nextDate,
+        dayOffset: Math.max(0, diffCalendarDays(params.plan.startDate, nextDate)),
+      };
+    }
+
+    return s;
+  });
+
+  const updatedPlan: StudyPlan = {
+    ...params.plan,
+    masterByDate: latestDate,
+    sessions: updatedSessions,
+  };
+  const plans = loadLocalPlans(activeUser).map((p) =>
+    p.id === updatedPlan.id ? updatedPlan : p
+  );
+  saveLocalPlans(plans, activeUser);
+  return { updatedPlan, shiftedCount };
+}
+
 export async function submitRecallForGrading(params: {
   plan: StudyPlan;
   session: StudySession;
   userResponseText: string;
+  user?: UserAccount | null;
 }): Promise<{
   evaluation: GradeRecallEvaluation;
   updatedPlan: StudyPlan;
+  persistedInMySql: boolean;
 }> {
   let evaluation: GradeRecallEvaluation | null = null;
+  let persistedInMySql = false;
+  let serverAttemptId: number | null = null;
+  let serverCompletedAt: string | null = null;
+  const activeUser = params.user || getStoredUser();
+
+  const stageNumber = resolveStageNumber(params.session);
 
   try {
     const res = await fetch(`${API_BASE}/gemini.php?action=grade_recall`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(),
+      },
       body: JSON.stringify({
         action: 'grade_recall',
         sessionId: params.session.id,
         topicTitle: params.plan.topicTitle,
+        stageNumber,
         stageName: params.session.stageName,
         cognitiveGoal: params.session.cognitiveGoal,
         prompts: params.session.prompts,
+        promptItems: params.session.promptItems || [],
         verificationChecklist: params.session.verificationChecklist,
         extractedContextCache: params.plan.extractedContextCache,
         userResponseText: params.userResponseText,
@@ -366,6 +1208,11 @@ export async function submitRecallForGrading(params: {
       const data = await res.json();
       if (data.ok && data.evaluation) {
         evaluation = data.evaluation as GradeRecallEvaluation;
+        persistedInMySql = Boolean(data.persistedInMySql);
+        serverAttemptId =
+          typeof data.attemptId === 'number' ? data.attemptId : null;
+        serverCompletedAt =
+          typeof data.completedAt === 'string' ? data.completedAt : null;
       }
     }
   } catch {
@@ -380,20 +1227,80 @@ export async function submitRecallForGrading(params: {
     );
   }
 
-  const nowIso = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const nowIso =
+    serverCompletedAt ||
+    new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  if (!persistedInMySql) {
+    try {
+      const saveRes = await fetch(
+        `${API_BASE}/plans.php?action=save_recall_attempt`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildAuthHeaders(),
+          },
+          body: JSON.stringify({
+            sessionId: params.session.id,
+            userResponseText: params.userResponseText,
+            masteryScore: evaluation.masteryScore,
+            whatYouNailed: evaluation.whatYouNailed || evaluation.accuratePoints,
+            accuratePoints: evaluation.accuratePoints,
+            cognitiveStageCheck: evaluation.cognitiveStageCheck,
+            missingToReview:
+              evaluation.missingToReview || evaluation.missedOrInaccurateConcepts,
+            missedOrInaccurateConcepts: evaluation.missedOrInaccurateConcepts,
+            coachFeedback: evaluation.coachFeedback,
+            socraticFollowUpQuestion: evaluation.socraticFollowUpQuestion,
+            completedAt: nowIso,
+          }),
+        }
+      );
+      const saveContentType = saveRes.headers.get('content-type') || '';
+      if (saveRes.ok && saveContentType.includes('application/json')) {
+        const saveData = await saveRes.json();
+        if (saveData.ok && saveData.plan) {
+          const syncedPlan = normalizePlanData({
+            ...(saveData.plan as StudyPlan),
+            studyWindow: params.plan.studyWindow,
+          });
+          const plans = loadLocalPlans(activeUser);
+          const updatedPlans = plans.map((p) =>
+            p.id === syncedPlan.id ? syncedPlan : p
+          );
+          saveLocalPlans(updatedPlans, activeUser);
+          return {
+            evaluation,
+            updatedPlan: syncedPlan,
+            persistedInMySql: true,
+          };
+        }
+      }
+    } catch {
+      // Fall back to local cache update if MySQL backend is offline
+    }
+  }
+
+  const nailed = evaluation.whatYouNailed || evaluation.accuratePoints;
+  const missing = evaluation.missingToReview || evaluation.missedOrInaccurateConcepts;
+
   const newAttempt = {
-    id: Date.now(),
+    id: serverAttemptId || Date.now(),
     sessionId: params.session.id,
     userResponseText: params.userResponseText,
     aiScore: evaluation.masteryScore,
-    strengths: evaluation.accuratePoints,
-    missingConcepts: evaluation.missedOrInaccurateConcepts,
+    strengths: nailed,
+    whatYouNailed: nailed,
+    missingConcepts: missing,
+    missingToReview: missing,
     correctiveFeedback: evaluation.coachFeedback,
+    cognitiveStageCheck: evaluation.cognitiveStageCheck,
     followUpQuestion: evaluation.socraticFollowUpQuestion,
     createdAt: nowIso,
   };
 
-  const plans = loadLocalPlans();
+  const plans = loadLocalPlans(activeUser);
   const updatedPlans = plans.map((p) => {
     if (p.id !== params.plan.id) return p;
     return {
@@ -411,28 +1318,31 @@ export async function submitRecallForGrading(params: {
     };
   });
 
-  saveLocalPlans(updatedPlans);
+  saveLocalPlans(updatedPlans, activeUser);
   const updatedPlan =
     updatedPlans.find((p) => p.id === params.plan.id) || params.plan;
 
-  return { evaluation, updatedPlan };
+  return { evaluation, updatedPlan, persistedInMySql };
 }
 
-/**
- * Schedule an Adaptive Booster Session (+2 Days) when masteryScore < 70.
- */
 export async function scheduleAdaptiveBoosterSession(params: {
   plan: StudyPlan;
   session: StudySession;
   missingConcepts: string[];
   followUpQuestion: string;
+  user?: UserAccount | null;
 }): Promise<{ updatedPlan: StudyPlan; newSession: StudySession }> {
+  const activeUser = params.user || getStoredUser();
+
   try {
     const res = await fetch(
       `${API_BASE}/plans.php?action=add_booster_session`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildAuthHeaders(),
+        },
         body: JSON.stringify({
           action: 'add_booster_session',
           sessionId: params.session.id,
@@ -445,11 +1355,11 @@ export async function scheduleAdaptiveBoosterSession(params: {
     if (res.ok && contentType.includes('application/json')) {
       const data = await res.json();
       if (data.ok && data.plan) {
-        const updatedPlan = data.plan as StudyPlan;
-        const plans = loadLocalPlans().map((p) =>
+        const updatedPlan = normalizePlanData(data.plan as StudyPlan);
+        const plans = loadLocalPlans(activeUser).map((p) =>
           p.id === updatedPlan.id ? updatedPlan : p
         );
-        saveLocalPlans(plans);
+        saveLocalPlans(plans, activeUser);
         const booster =
           updatedPlan.sessions.find((s) => s.id === data.boosterSessionId) ||
           updatedPlan.sessions[updatedPlan.sessions.length - 1];
@@ -465,34 +1375,45 @@ export async function scheduleAdaptiveBoosterSession(params: {
     params.session.scheduledDate > today ? params.session.scheduledDate : today;
   const boosterDate = addCalendarDays(baseDate, 2);
 
-  const remedialPrompts: string[] = [];
+  const remedialItems: SessionPromptItem[] = [];
   if (params.followUpQuestion) {
-    remedialPrompts.push(`Socratic Remediation: ${params.followUpQuestion}`);
+    remedialItems.push({
+      prompt_text: `Socratic Remediation: ${params.followUpQuestion}`,
+      expected_rubric_points: params.missingConcepts.slice(0, 3),
+    });
   }
   for (const concept of params.missingConcepts.slice(0, 3)) {
-    remedialPrompts.push(
-      `Targeted Retrieval Repair: Explain the exact mechanism and role of "${concept}" from memory without consulting source notes.`
-    );
+    remedialItems.push({
+      prompt_text: `Targeted Retrieval Repair: Explain the exact mechanism and role of "${concept}" from memory without consulting source notes.`,
+      expected_rubric_points: [
+        `Accurately explains ${concept}`,
+        'Connects mechanism back to core topic',
+      ],
+    });
   }
-  if (remedialPrompts.length === 0) {
-    remedialPrompts.push(...params.session.prompts.slice(0, 2));
+  if (remedialItems.length === 0) {
+    for (const p of params.session.prompts.slice(0, 2)) {
+      remedialItems.push({ prompt_text: p, expected_rubric_points: [] });
+    }
   }
 
   const newSession: StudySession = {
     id: Date.now(),
     planId: params.plan.id,
     sessionNumber: params.plan.sessions.length + 1,
+    stageNumber: resolveStageNumber(params.session),
     stageName: 'Adaptive Booster — Targeted Error Remediation (+2d)',
     scheduledDate: boosterDate,
     dayOffset: params.session.dayOffset + 2,
     gapDays: 2,
     cognitiveGoal: `Eliminate retrieval gaps identified in Session #${params.session.sessionNumber} and stabilize long-term memory consolidation.`,
-    prompts: remedialPrompts,
+    prompts: remedialItems.map((p) => p.prompt_text),
+    promptItems: remedialItems,
     verificationChecklist:
       params.missingConcepts.length > 0
         ? params.missingConcepts.map(
-            (c) => `Resolved & accurately retrieved: ${c}`
-          )
+          (c) => `Resolved & accurately retrieved: ${c}`
+        )
         : params.session.verificationChecklist,
     status: 'pending',
     masteryScore: null,
@@ -501,7 +1422,7 @@ export async function scheduleAdaptiveBoosterSession(params: {
     attempts: [],
   };
 
-  const plans = loadLocalPlans();
+  const plans = loadLocalPlans(activeUser);
   const updatedPlans = plans.map((p) => {
     if (p.id !== params.plan.id) return p;
     const allSessions = [...p.sessions, newSession].sort((a, b) =>
@@ -516,32 +1437,59 @@ export async function scheduleAdaptiveBoosterSession(params: {
     };
   });
 
-  saveLocalPlans(updatedPlans);
+  saveLocalPlans(updatedPlans, activeUser);
   const updatedPlan =
     updatedPlans.find((p) => p.id === params.plan.id) || params.plan;
 
   return { updatedPlan, newSession };
 }
 
-/**
- * Delete a Study Plan.
- */
-export async function deleteStudyPlan(planId: number): Promise<StudyPlan[]> {
+export async function deleteStudyPlan(
+  planId: number,
+  user?: UserAccount | null
+): Promise<StudyPlan[]> {
+  const activeUser = user || getStoredUser();
+  markSeedInitialized(getPlansStorageKey(activeUser));
+  let deletedRemotely = false;
+
   try {
-    await fetch(`${API_BASE}/plans.php?plan_id=${encodeURIComponent(planId)}`, {
-      method: 'DELETE',
-    });
+    const res = await fetch(
+      `${API_BASE}/plans.php?plan_id=${encodeURIComponent(planId)}`,
+      {
+        method: 'DELETE',
+        headers: {
+          ...buildAuthHeaders(),
+        },
+      }
+    );
+    deletedRemotely = res.ok;
   } catch {
-    // Continue with local deletion
+    deletedRemotely = false;
   }
-  const remaining = loadLocalPlans().filter((p) => p.id !== planId);
-  saveLocalPlans(remaining);
+
+  if (!deletedRemotely) {
+    try {
+      await fetch(`${API_BASE}/plans.php?action=delete_plan`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildAuthHeaders(),
+        },
+        body: JSON.stringify({ planId }),
+      });
+    } catch {
+      // Continue with local deletion if offline
+    }
+  }
+
+  const remaining = loadLocalPlans(activeUser).filter((p) => p.id !== planId);
+  saveLocalPlans(remaining, activeUser);
   return remaining;
 }
 
-/**
- * Deterministic rubric-based fallback evaluator when running in local preview without PHP backend.
- */
+// -----------------------------------------------------------------------------
+// Stage-Aware Rubric Fallback Evaluator & Plan Synthesizer
+// -----------------------------------------------------------------------------
 function evaluateRecallAgainstRubricFallback(
   plan: StudyPlan,
   session: StudySession,
@@ -553,11 +1501,18 @@ function evaluateRecallAgainstRubricFallback(
     .split(/\s+/)
     .filter(Boolean).length;
 
+  const rubricPool = new Set<string>(session.verificationChecklist || []);
+  for (const pi of session.promptItems || []) {
+    for (const rp of pi.expected_rubric_points || []) {
+      if (rp.trim()) rubricPool.add(rp.trim());
+    }
+  }
+  const combinedRubric = Array.from(rubricPool);
+
   const accuratePoints: string[] = [];
   const missedOrInaccurateConcepts: string[] = [];
 
-  for (const criterion of session.verificationChecklist) {
-    // Extract meaningful keywords (>= 4 chars) from each rubric checklist item
+  for (const criterion of combinedRubric) {
     const keywords = criterion
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, ' ')
@@ -571,7 +1526,7 @@ function evaluateRecallAgainstRubricFallback(
             'with',
             'from',
             'into',
-            'Correctly',
+            'correctly',
             'explains',
             'describes',
             'identifies',
@@ -584,16 +1539,48 @@ function evaluateRecallAgainstRubricFallback(
     const matchedCount = keywords.filter((kw) => normalized.includes(kw)).length;
     const ratio = keywords.length > 0 ? matchedCount / keywords.length : 0;
 
-    if (ratio >= 0.32 && wordCount >= 18) {
+    if (ratio >= 0.30 && wordCount >= 15) {
       accuratePoints.push(criterion);
     } else {
       missedOrInaccurateConcepts.push(criterion);
     }
   }
 
+  const stageNum = resolveStageNumber(session);
+  const hasCausal = /\b(because|therefore|causes?|leads? to|results? in|mechanism|whereas|unlike)\b/i.test(
+    responseText
+  );
+  const hasStructural = /\b(category|pillars?|components?|stages?|connects?|links?|hierarchy|workflow)\b/i.test(
+    responseText
+  );
+  const hasScenario = /\b(diagnos|predict|scenario|edge case|fail|disrupt|solution|outcome)\b/i.test(
+    responseText
+  );
+
+  const cognitiveStageCheck =
+    stageNum === 1
+      ? hasStructural
+        ? 'Stage 1 Check Passed: You organized high-level categories and traced how core components connect.'
+        : 'Stage 1 Check: Zoom out slightly to explicitly group the main categories and describe how each component connects in the overall structure.'
+      : stageNum === 2
+        ? wordCount >= 25
+          ? 'Stage 2 Check Passed: Solid unassisted retrieval of core terms and definitions from memory.'
+          : 'Stage 2 Check: Try expanding your unassisted brain-dump with more foundational definitions and key terms before unlocking the digest.'
+        : stageNum === 3
+          ? hasCausal
+            ? 'Stage 3 Check Passed: You explained causal "why" and "how" mechanisms rather than stopping at surface definitions.'
+            : 'Stage 3 Check: You stated what happens, but Stage 3 requires causal reasoning—explicitly explain WHY the mechanism works and HOW one step drives the next.'
+          : stageNum === 4
+            ? hasScenario || hasCausal
+              ? 'Stage 4 Check Passed: You applied principles to diagnose behavior and justify your solution.'
+              : 'Stage 4 Check: Trace the scenario step-by-step—diagnose what fails, predict what shifts if a variable changes, and justify your recommendation.'
+            : wordCount >= 40 && hasCausal
+              ? 'Stage 5 Check Passed: Cohesive, rigorous synthesis suitable for teaching a peer.'
+              : 'Stage 5 Check: Tie all major subtopics together into one complete, exam-ready explanation with zero conceptual gaps.';
+
   const checklistRatio =
-    session.verificationChecklist.length > 0
-      ? accuratePoints.length / session.verificationChecklist.length
+    combinedRubric.length > 0
+      ? accuratePoints.length / combinedRubric.length
       : 0.5;
   const depthBonus = Math.min(25, Math.floor(wordCount / 6));
   const rawScore = Math.round(checklistRatio * 75 + depthBonus);
@@ -601,7 +1588,7 @@ function evaluateRecallAgainstRubricFallback(
 
   if (accuratePoints.length === 0 && wordCount >= 10) {
     accuratePoints.push(
-      `Initiated closed-book active recall (${wordCount} words) addressing ${plan.topicTitle}.`
+      `Initiated closed-book Stage ${stageNum} retrieval (${wordCount} words) addressing ${plan.topicTitle}.`
     );
   }
 
@@ -609,22 +1596,25 @@ function evaluateRecallAgainstRubricFallback(
 
   const coachFeedback =
     masteryScore >= 80
-      ? `Strong closed-book retrieval (${masteryScore}% mastery)! You articulated the core mechanisms clearly. Review any remaining nuance in the verification rubric below to lock in 100% precision before your next expanding-interval session.`
+      ? `Strong ${session.stageName} retrieval (${masteryScore}% mastery)! You demonstrated clear command of the target concepts. Review any remaining nuance below to lock in 100% precision.`
       : masteryScore >= 70
-      ? `Solid foundational recall (${masteryScore}%), though ${missedOrInaccurateConcepts.length} rubric criterion(s) need tighter mechanistic specificity. Compare your response with the unlocked Source Digest and answer the Socratic follow-up below.`
-      : `Your retrieval attempt (${masteryScore}%) reveals fragile encoding on key mechanisms (${missedOrInaccurateConcepts.length} checklist criteria missed). Because effortful retrieval errors are the strongest signal for memory reconsolidation, schedule an Adaptive Booster Session (+2 Days) below to reinforce these traces before they decay.`;
+        ? `Solid foundational recall (${masteryScore}%), though ${missedOrInaccurateConcepts.length} rubric point(s) need tighter stage-specific precision.`
+        : `Your retrieval attempt (${masteryScore}%) highlights fragile encoding (${missedOrInaccurateConcepts.length} rubric point(s) missed). Schedule an Adaptive Booster (+2 Days) below to reinforce these memory traces.`;
 
   const firstMissed =
     missedOrInaccurateConcepts[0] ||
-    session.verificationChecklist[0] ||
+    combinedRubric[0] ||
     plan.coreConcepts[0]?.title ||
     plan.topicTitle;
 
-  const socraticFollowUpQuestion = `Focusing specifically on "${firstMissed}", what is the underlying causal mechanism that links this concept to the rest of ${plan.topicTitle}, and what would fail if that mechanism were disrupted?`;
+  const socraticFollowUpQuestion = `Focusing specifically on "${firstMissed}", what is the underlying causal mechanism connecting this to ${plan.topicTitle}, and what fails if it is disrupted?`;
 
   return {
     masteryScore,
+    whatYouNailed: accuratePoints,
     accuratePoints,
+    cognitiveStageCheck,
+    missingToReview: missedOrInaccurateConcepts,
     missedOrInaccurateConcepts,
     coachFeedback,
     socraticFollowUpQuestion,
@@ -632,9 +1622,102 @@ function evaluateRecallAgainstRubricFallback(
   };
 }
 
-/**
- * Synthesize a structured StudyPlan locally when `/study/api/gemini.php` is unreachable in offline dev preview.
- */
+function buildStagePromptItemsFallback(
+  stageNum: CognitiveStageNumber,
+  cleanTitle: string
+): SessionPromptItem[] {
+  if (stageNum === 1) {
+    return [
+      {
+        prompt_text: `Map the macro architecture of "${cleanTitle}": list its 3–5 main categories or pillars and explain how each component connects.`,
+        expected_rubric_points: [
+          `Identifies 3–5 core categories of ${cleanTitle}`,
+          'Describes high-level structural or sequential links between categories',
+          'Avoids getting lost in minor trivia before building the blueprint',
+        ],
+      },
+      {
+        prompt_text: `Trace the overall workflow or conceptual hierarchy of "${cleanTitle}" from primary inputs to final outcomes.`,
+        expected_rubric_points: [
+          'Identifies major inputs, transformations, and outputs',
+          'Clarifies boundary roles for each major component',
+          'Shows how upstream elements constrain downstream elements',
+        ],
+      },
+    ];
+  }
+  if (stageNum === 2) {
+    return [
+      {
+        prompt_text: `Closed-Book Definition & Key Term Recall: Without checking notes, list and define the core terminology, rules, and foundational facts of "${cleanTitle}".`,
+        expected_rubric_points: [
+          `Accurately defines primary terms in ${cleanTitle}`,
+          'Retrieves foundational rules or equations from memory',
+          'Uses precise domain terminology rather than vague summaries',
+        ],
+      },
+      {
+        prompt_text: `Core Fact Sweep: Write out every essential sequence step, threshold, or primary property of "${cleanTitle}" you can recall unassisted.`,
+        expected_rubric_points: [
+          'Recalls exact steps or properties in correct order',
+          'Captures critical constraints or quantitative thresholds',
+          'Demonstrates unassisted recall before consulting materials',
+        ],
+      },
+    ];
+  }
+  if (stageNum === 3) {
+    return [
+      {
+        prompt_text: `Why & How Mechanism Analysis: Explain WHY the primary mechanism in "${cleanTitle}" operates the way it does and HOW one step triggers the next.`,
+        expected_rubric_points: [
+          'Explains causal why/how relationships instead of surface definitions',
+          'Traces step-by-step cause-and-effect links',
+          'Identifies underlying driving principles',
+        ],
+      },
+      {
+        prompt_text: `Compare & Contrast: Contrast two closely related concepts or pathways within "${cleanTitle}" and explain why they produce different outcomes.`,
+        expected_rubric_points: [
+          'Contrasts two related concepts along concrete mechanistic axes',
+          'Explains why each difference matters functionally',
+          'Identifies conditions favoring one over the other',
+        ],
+      },
+    ];
+  }
+  if (stageNum === 4) {
+    return [
+      {
+        prompt_text: `Diagnostic Edge-Case Scenario: Suppose a primary variable or constraint in "${cleanTitle}" fails or shifts sharply. Diagnose what breaks, predict the downstream outcome, and justify your reasoning.`,
+        expected_rubric_points: [
+          'Identifies root cause of the breakdown in the scenario',
+          'Predicts downstream consequences accurately',
+          'Justifies prediction using first-principles rules',
+        ],
+      },
+      {
+        prompt_text: `Applied Problem-Solving: Design or evaluate a practical solution for a realistic challenge in "${cleanTitle}" and explain how you handle boundary conditions.`,
+        expected_rubric_points: [
+          'Applies domain principles to a concrete problem',
+          'Accounts for edge cases or trade-offs',
+          'Defends chosen approach logically',
+        ],
+      },
+    ];
+  }
+  return [
+    {
+      prompt_text: `Mastery Synthesis Challenge: Explain "${cleanTitle}" completely from first principles as if teaching an intelligent peer—connecting the high-level blueprint, causal mechanisms, and key edge cases with zero conceptual gaps.`,
+      expected_rubric_points: [
+        'Synthesizes macro architecture, foundational definitions, and causal mechanisms',
+        'Uses clear, jargon-free explanations without hand-waving',
+        'Integrates diagnostic edge cases and boundary conditions fluently',
+      ],
+    },
+  ];
+}
+
 function buildSynthesizedPlanFallback(params: {
   topicPrompt: string;
   urls: string[];
@@ -651,7 +1734,6 @@ function buildSynthesizedPlanFallback(params: {
     params.files[0]?.name.replace(/\.[^.]+$/, '') ||
     'Custom Spaced Mastery Plan';
 
-  // Extract decoded text from uploaded text/markdown/csv files if present
   const decodedSnippets: string[] = [];
   for (const f of params.files) {
     if (
@@ -695,36 +1777,41 @@ function buildSynthesizedPlanFallback(params: {
       summary:
         'Evaluates how to diagnose breakdowns, distinguish look-alike concepts, and apply rules to novel problems.',
       connections:
-        'Tested directly in Stage 4 Application scenarios and the final Feynman Teach-Back synthesis.',
+        'Tested directly in Stage 4 Application scenarios and Stage 5 Mastery Verification synthesis.',
     },
   ];
 
-  const sessions: StudySession[] = params.scheduledBlueprints.map((bp, idx) => ({
-    id: planId + idx + 1,
-    planId,
-    sessionNumber: bp.sessionNumber,
-    stageName: bp.stageName,
-    scheduledDate: bp.scheduledDate,
-    dayOffset: bp.dayOffset,
-    gapDays: bp.gapDays,
-    cognitiveGoal: bp.cognitiveGoal,
-    prompts: [
-      `[${bp.stageName}] Closed-Book Prompt 1: Without consulting source notes, reconstruct the core conceptual architecture and primary mechanisms of "${cleanTitle}".`,
-      `[${bp.stageName}] Closed-Book Prompt 2: Explain why the key processes in "${cleanTitle}" operate the way they do, highlighting cause-and-effect relationships.`,
-      `[${bp.stageName}] Closed-Book Prompt 3: Create a concrete diagnostic scenario or real-world edge case for "${cleanTitle}" and solve it step-by-step from memory.`,
-    ],
-    verificationChecklist: [
-      `Accurately defines the core principles and terminology of ${cleanTitle} without vague generalizations.`,
-      'Articulates the causal "why" and "how" linking the macro conceptual pillars.',
-      'Identifies boundary conditions, failure modes, or contrasting edge cases.',
-      'Demonstrates clear, jargon-free Feynman synthesis suitable for teaching a novice.',
-    ],
-    status: 'pending',
-    masteryScore: null,
-    calendarEventId: null,
-    completedAt: null,
-    attempts: [],
-  }));
+  const sessions: StudySession[] = params.scheduledBlueprints.map((bp, idx) => {
+    const stageNumber = resolveStageNumber({
+      stageNumber: bp.stageNumber,
+      stageName: bp.stageName,
+      sessionNumber: bp.sessionNumber,
+    });
+    const promptItems = buildStagePromptItemsFallback(stageNumber, cleanTitle);
+    const checklist = promptItems
+      .flatMap((pi) => pi.expected_rubric_points)
+      .slice(0, 6);
+
+    return {
+      id: planId + idx + 1,
+      planId,
+      sessionNumber: bp.sessionNumber,
+      stageNumber,
+      stageName: normalizeStageName(bp.stageName),
+      scheduledDate: bp.scheduledDate,
+      dayOffset: bp.dayOffset,
+      gapDays: bp.gapDays,
+      cognitiveGoal: bp.cognitiveGoal,
+      prompts: promptItems.map((pi) => pi.prompt_text),
+      promptItems,
+      verificationChecklist: checklist,
+      status: 'pending',
+      masteryScore: null,
+      calendarEventId: null,
+      completedAt: null,
+      attempts: [],
+    };
+  });
 
   return {
     id: planId,
@@ -755,4 +1842,3 @@ function buildSynthesizedPlanFallback(params: {
     studyWindow: params.studyWindow,
   };
 }
-

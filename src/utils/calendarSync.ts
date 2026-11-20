@@ -251,6 +251,7 @@ export async function syncPlanToGoogleCalendar(
   let conflictsAvoided = 0;
 
   for (const session of plan.sessions) {
+    if (session.status === 'merged') continue;
     const slot = await findOpenSlotViaFreeBusy(
       accessToken,
       session.scheduledDate,
@@ -333,6 +334,7 @@ export async function syncPlanToGoogleTasks(
   const mappings: Array<{ sessionId: number; calendarEventId: string }> = [];
 
   for (const session of plan.sessions) {
+    if (session.status === 'merged') continue;
     const title = `[Practice Buddy #${session.sessionNumber}] ${plan.topicTitle} — ${session.stageName}`;
     const notes = buildSessionSyncDescription(plan, session);
     const dueDate = parseLocalDate(session.scheduledDate);
@@ -414,6 +416,7 @@ export function downloadPlanAsIcs(
   ];
 
   for (const session of plan.sessions) {
+    if (session.status === 'merged') continue;
     const startDt = parseLocalDate(session.scheduledDate);
     startDt.setHours(startH || 9, startM || 0, 0, 0);
     const endDt = new Date(startDt.getTime() + durationMin * 60 * 1000);

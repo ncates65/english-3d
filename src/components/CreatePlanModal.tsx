@@ -19,6 +19,7 @@ import {
   StudyWindowConfig,
   SyncMode,
   UploadedFilePayload,
+  UserAccount,
 } from '../types/study';
 import {
   addCalendarDays,
@@ -30,33 +31,36 @@ import { generateAndSaveStudyPlan } from '../services/apiClient';
 interface CreatePlanModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onPlanCreated: (plan: StudyPlan, autoSyncMode: SyncMode) => void;
+  currentUser?: UserAccount | null;
+  onPlanCreated: (
+    plan: StudyPlan,
+    autoSyncMode: SyncMode,
+    persistedInMySql: boolean
+  ) => void;
 }
 
-const SAMPLE_PRESETS = [
-  {
-    label: 'Cellular Respiration & ATP',
-    topic:
-      'Bioenergetics: Glycolysis, Pyruvate Oxidation, Citric Acid Cycle, Electron Transport Chain (Complexes I–IV), Chemiosmotic Proton-Motive Force, PFK-1 Allosteric Regulation, and Clinical Uncouplers (2,4-DNP, UCP1).',
-    days: 14,
-  },
-  {
-    label: 'Distributed Systems: Raft & CAP',
-    topic:
-      'Distributed Consensus & Fault Tolerance: CAP Theorem vs. PACELC, Raft Leader Election, Log Replication, Safety & Split-Brain Prevention, Linearizability vs. Sequential Consistency.',
-    days: 21,
-  },
-  {
-    label: 'Exam Cram (3-Day Ultra-Short)',
-    topic:
-      'Cardiac Electrophysiology & Antiarrhythmics: Sinoatrial Node Pacemaker Potentials (Phase 0, 3, 4), Ventricular Myocyte Action Potential (Phase 0–4), and Vaughan Williams Class I–IV Mechanisms.',
-    days: 3,
-  },
-];
+const StepBadge: React.FC<{ num: number }> = ({ num }) => (
+  <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-600 to-teal-600 text-xs font-extrabold text-white shadow-xs">
+    {num}
+  </span>
+);
+
+function snapToFiveMinuteStep(timeValue: string): string {
+  const match = /^(\d{2}):(\d{2})$/.exec(timeValue.trim());
+  if (!match) return timeValue;
+  let hours = Number(match[1]);
+  let mins = Math.round(Number(match[2]) / 5) * 5;
+  if (mins >= 60) {
+    mins = 0;
+    hours = Math.min(23, hours + 1);
+  }
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+}
 
 export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
   isOpen,
   onClose,
+  currentUser,
   onPlanCreated,
 }) => {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
@@ -112,21 +116,32 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
     // Fallback for browsers that do not yet support declarative `closedby="any"`
     let cleanupFallback: (() => void) | undefined;
     if (!('closedBy' in HTMLDialogElement.prototype)) {
-      const handleBackdropClick = (event: MouseEvent) => {
-        if (event.target !== dialog) return;
+      let pointerStartedOnBackdrop = false;
+      const isBackdropEvent = (event: PointerEvent) => {
+        if (event.target !== dialog) return false;
         const rect = dialog.getBoundingClientRect();
-        const isDialogContent =
+        return !(
           rect.top <= event.clientY &&
           event.clientY <= rect.top + rect.height &&
           rect.left <= event.clientX &&
-          event.clientX <= rect.left + rect.width;
-        if (!isDialogContent) {
+          event.clientX <= rect.left + rect.width
+        );
+      };
+      const handlePointerDown = (event: PointerEvent) => {
+        pointerStartedOnBackdrop = isBackdropEvent(event);
+      };
+      const handlePointerUp = (event: PointerEvent) => {
+        if (pointerStartedOnBackdrop && isBackdropEvent(event)) {
           dialog.close();
         }
+        pointerStartedOnBackdrop = false;
       };
-      dialog.addEventListener('click', handleBackdropClick);
-      cleanupFallback = () =>
-        dialog.removeEventListener('click', handleBackdropClick);
+      dialog.addEventListener('pointerdown', handlePointerDown);
+      dialog.addEventListener('pointerup', handlePointerUp);
+      cleanupFallback = () => {
+        dialog.removeEventListener('pointerdown', handlePointerDown);
+        dialog.removeEventListener('pointerup', handlePointerUp);
+      };
     }
 
     return () => {
@@ -182,12 +197,6 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
     setFiles((prev) => [...prev, ...newPayloads]);
   };
 
-  const handlePresetApply = (preset: (typeof SAMPLE_PRESETS)[number]) => {
-    setTopicPrompt(preset.topic);
-    setMasterByDate(addCalendarDays(startDate, preset.days));
-    setErrorMessage(null);
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
@@ -206,14 +215,16 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
 
     setIsGenerating(true);
     try {
+      const normalizedStartHour = snapToFiveMinuteStep(startHour);
+      const normalizedEndHour = snapToFiveMinuteStep(endHour);
       const studyWindow: StudyWindowConfig = {
-        startHour,
-        endHour,
+        startHour: normalizedStartHour,
+        endHour: normalizedEndHour,
         durationMinutes,
         syncMode,
       };
 
-      const { plan } = await generateAndSaveStudyPlan({
+      const { plan, persistedInMySql } = await generateAndSaveStudyPlan({
         topicPrompt,
         urls,
         files,
@@ -221,9 +232,10 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
         masterByDate,
         scheduledBlueprints: spacingPreview.sessions,
         studyWindow,
+        user: currentUser,
       });
 
-      onPlanCreated(plan, syncMode);
+      onPlanCreated(plan, syncMode, persistedInMySql);
       onClose();
     } catch (err) {
       setErrorMessage(
@@ -244,17 +256,14 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 px-6 py-4 bg-white/95 dark:bg-slate-900/95 sticky top-0 z-10">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400">
-            <Sparkles className="h-5 w-5" />
-          </div>
-          <div>
-            <h2 id={titleId} className="text-lg font-bold text-slate-900 dark:text-white">
-              Practice Buddy — Multi-Modal Study Input Hub
-            </h2>
-            <p className="text-xs text-slate-600 dark:text-slate-400">
-              Cepeda et al. (2008) Optimal Spacing Engine + Gemini 3.8 Flash Cognitive Scaffolding
-            </p>
-          </div>
+          <img
+            src="/study/logo.png"
+            alt="Practice Buddy"
+            className="h-9 w-9 rounded-xl object-contain shrink-0"
+          />
+          <h2 id={titleId} className="text-lg font-bold text-slate-900 dark:text-white">
+            Create a Study Plan
+          </h2>
         </div>
         <button
           type="button"
@@ -268,30 +277,14 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
 
       {/* Form Body */}
       <form onSubmit={handleSubmit} className="overflow-y-auto p-6 space-y-6">
-        {/* Quick Sample Presets */}
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">
-            Quick Templates:
-          </span>
-          {SAMPLE_PRESETS.map((preset) => (
-            <button
-              key={preset.label}
-              type="button"
-              onClick={() => handlePresetApply(preset)}
-              className="rounded-full border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/70 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:border-emerald-500/50 hover:bg-emerald-500/10 transition"
-            >
-              + {preset.label} ({preset.days}d)
-            </button>
-          ))}
-        </div>
-
         {/* 1. Topic / Focus Prompt */}
         <div>
           <label
             htmlFor="topic-prompt-input"
-            className="block text-sm font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+            className="flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white mb-2"
           >
-            1. Study Topic, Exam Objectives, or Focus Prompt
+            <StepBadge num={1} />
+            <span>Study Topic, Exam Objectives, or Focus Prompt</span>
           </label>
           <textarea
             id="topic-prompt-input"
@@ -309,8 +302,9 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* File Dropzone */}
           <div className="flex flex-col">
-            <span className="block text-sm font-semibold text-slate-800 dark:text-slate-200 mb-1.5">
-              2. Multimodal Study Files (PDF, DOCX, TXT, MD, CSV, Slides)
+            <span className="flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white mb-2">
+              <StepBadge num={2} />
+              <span>Multimodal Study Files (PDF, DOCX, TXT, MD, CSV, Slides)</span>
             </span>
             <label
               onDragOver={(e) => {
@@ -388,9 +382,10 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
           <div className="flex flex-col">
             <label
               htmlFor="url-harvester-input"
-              className="block text-sm font-semibold text-slate-800 dark:text-slate-200 mb-1.5"
+              className="flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white mb-2"
             >
-              3. URL / Link Harvester (Articles, Docs, YouTube)
+              <StepBadge num={3} />
+              <span>URL / Link Harvester (Articles, Docs, YouTube)</span>
             </label>
             <div className="flex gap-2">
               <div className="relative flex-1">
@@ -418,9 +413,6 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
                 <Plus className="h-3.5 w-3.5" /> Add
               </button>
             </div>
-            <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              <code>api/gemini.php</code> scrapes and cleans HTML text via cURL and stores a 1,000–2,000 word structured digest in MySQL.
-            </p>
 
             {urls.length > 0 && (
               <ul className="mt-2.5 space-y-1.5 max-h-32 overflow-y-auto">
@@ -449,19 +441,17 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
           </div>
         </div>
 
-        {/* 3. Temporal Controls & Evidence-Based Spacing Preview */}
+        {/* 4. Timeline & Evidence-Based Spacing Preview */}
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/70 p-4 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+            <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2.5">
+              <StepBadge num={4} />
               <Calendar className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-              4. Temporal Horizon &amp; Preferred Study Window
+              <span>Timeline</span>
             </h3>
-            <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-3 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-300">
-              {spacingPreview.horizonLabel} • {spacingPreview.sessions.length} Sessions
-            </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label
                 htmlFor="start-date-input"
@@ -494,55 +484,13 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
                 className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs text-slate-900 dark:text-white focus:border-emerald-600 dark:focus:border-emerald-400 focus:outline-none"
               />
             </div>
+          </div>
 
-            <div>
-              <label
-                htmlFor="study-window-start"
-                className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1"
-              >
-                Preferred Window (FreeBusy)
-              </label>
-              <div className="flex items-center gap-1.5">
-                <input
-                  id="study-window-start"
-                  type="time"
-                  value={startHour}
-                  onChange={(e) => setStartHour(e.target.value)}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-2 text-xs text-slate-900 dark:text-white"
-                />
-                <span className="text-slate-500 text-xs">–</span>
-                <input
-                  type="time"
-                  aria-label="Study window end time"
-                  value={endHour}
-                  onChange={(e) => setEndHour(e.target.value)}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-2 text-xs text-slate-900 dark:text-white"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label
-                htmlFor="block-duration-select"
-                className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1"
-              >
-                Session Block Length
-              </label>
-              <div className="relative">
-                <Clock className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                <select
-                  id="block-duration-select"
-                  value={durationMinutes}
-                  onChange={(e) => setDurationMinutes(Number(e.target.value))}
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-8 pr-3 py-2 text-xs text-slate-900 dark:text-white"
-                >
-                  <option value={25}>25 mins (Pomodoro)</option>
-                  <option value={30}>30 mins (Recommended)</option>
-                  <option value={45}>45 mins (Deep Practice)</option>
-                  <option value={60}>60 mins (Full Mastery)</option>
-                </select>
-              </div>
-            </div>
+          {/* Dynamic Horizon Status Badge directly underneath date selectors */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-2 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-3.5 py-1 text-xs font-semibold text-emerald-800 dark:text-emerald-200">
+              {spacingPreview.horizonLabel} • {spacingPreview.sessions.length} Sessions
+            </span>
           </div>
 
           {/* Compressed Horizon Warning Badge when T <= 3 */}
@@ -594,10 +542,78 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
           </div>
         </div>
 
-        {/* 5. Sync Mode Selection */}
+        {/* 5. Preferred Study Window */}
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/70 p-4 space-y-3">
+          <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2.5">
+            <StepBadge num={5} />
+            <Clock className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+            <span>Preferred Study Window</span>
+          </h3>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label
+                htmlFor="study-window-start"
+                className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1"
+              >
+                Preferred Window (FreeBusy)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="study-window-start"
+                  type="time"
+                  step={300}
+                  value={startHour}
+                  onChange={(e) => setStartHour(e.target.value)}
+                  onBlur={(e) => setStartHour(snapToFiveMinuteStep(e.target.value))}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs text-slate-900 dark:text-white focus:border-emerald-600 dark:focus:border-emerald-400 focus:outline-none"
+                />
+                <span className="text-slate-500 text-xs">–</span>
+                <input
+                  type="time"
+                  step={300}
+                  aria-label="Study window end time"
+                  value={endHour}
+                  onChange={(e) => setEndHour(e.target.value)}
+                  onBlur={(e) => setEndHour(snapToFiveMinuteStep(e.target.value))}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-2 text-xs text-slate-900 dark:text-white focus:border-emerald-600 dark:focus:border-emerald-400 focus:outline-none"
+                />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                5-minute increments (:00, :05, ..., :55)
+              </p>
+            </div>
+
+            <div>
+              <label
+                htmlFor="block-duration-select"
+                className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1"
+              >
+                Session Block Length
+              </label>
+              <div className="relative">
+                <Clock className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
+                <select
+                  id="block-duration-select"
+                  value={durationMinutes}
+                  onChange={(e) => setDurationMinutes(Number(e.target.value))}
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 pl-8 pr-3 py-2 text-xs text-slate-900 dark:text-white"
+                >
+                  <option value={25}>25 mins (Pomodoro)</option>
+                  <option value={30}>30 mins (Recommended)</option>
+                  <option value={45}>45 mins (Deep Practice)</option>
+                  <option value={60}>60 mins (Full Mastery)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 6. Sync Mode Selection */}
         <div>
-          <span className="block text-sm font-semibold text-slate-800 dark:text-slate-200 mb-2">
-            5. Calendar &amp; Tasks Deep-Link Sync Mode
+          <span className="flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white mb-2.5">
+            <StepBadge num={6} />
+            <span>Calendar &amp; Tasks Deep-Link Sync Mode</span>
           </span>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {[
@@ -673,8 +689,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
             ) : (
               <>
                 <Sparkles className="h-4 w-4" />
-                Generate Practice Buddy Plan ({spacingPreview.sessions.length}{' '}
-                Sessions)
+                Create My Study Plan
               </>
             )}
           </button>

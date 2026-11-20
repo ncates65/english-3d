@@ -19,7 +19,12 @@ import {
   Trash2,
 } from 'lucide-react';
 import { StudyPlan, StudySession } from '../types/study';
-import { calculateSpacedSchedule } from '../utils/spacingEngine';
+import {
+  STAGE_GUIDANCE_CONFIG,
+  calculateSpacedSchedule,
+  normalizeStageName,
+  resolveStageNumber,
+} from '../utils/spacingEngine';
 import {
   buildGoogleCalendarTemplateUrl,
   buildSessionDeepLink,
@@ -441,7 +446,7 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
                     </div>
 
                     <h4 className="text-base font-bold text-slate-900 dark:text-white">
-                      {session.stageName}
+                      {normalizeStageName(session.stageName)}
                     </h4>
                     <p className="text-xs text-slate-600 dark:text-slate-300">
                       <strong className="text-slate-500 dark:text-slate-400">
@@ -500,7 +505,8 @@ export const PlanTimeline: React.FC<PlanTimelineProps> = ({
                 <div className="mt-4 rounded-xl border border-slate-200 dark:border-slate-800/90 bg-slate-50 dark:bg-slate-950/70 p-3.5">
                   <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">
                     <span>
-                      Assigned Active-Recall Prompts ({session.prompts.length})
+                      {STAGE_GUIDANCE_CONFIG[resolveStageNumber(session)].sectionHeader}{' '}
+                      ({session.prompts.length})
                     </span>
                     <span className="font-mono text-[11px] text-slate-500">
                       Deep Link: ?plan_id={plan.id}&amp;session_id={session.id}

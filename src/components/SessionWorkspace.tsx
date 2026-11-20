@@ -22,11 +22,17 @@ import {
   GradeRecallEvaluation,
   StudyPlan,
   StudySession,
+  UserAccount,
 } from '../types/study';
 import {
   scheduleAdaptiveBoosterSession,
   submitRecallForGrading,
 } from '../services/apiClient';
+import {
+  STAGE_GUIDANCE_CONFIG,
+  normalizeStageName,
+  resolveStageNumber,
+} from '../utils/spacingEngine';
 import {
   buildGoogleCalendarTemplateUrl,
   buildSessionDeepLink,
@@ -35,6 +41,7 @@ import {
 interface SessionWorkspaceProps {
   plan: StudyPlan;
   session: StudySession;
+  currentUser?: UserAccount | null;
   onBackToTimeline: () => void;
   onPlanUpdated: (updatedPlan: StudyPlan, nextSession?: StudySession) => void;
 }
@@ -65,6 +72,7 @@ interface SpeechRecognitionInstance {
 export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
   plan,
   session,
+  currentUser,
   onBackToTimeline,
   onPlanUpdated,
 }) => {
@@ -98,11 +106,17 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
 
     const latestAttempt = session.attempts?.[0];
     if (latestAttempt) {
+      const nailed = latestAttempt.whatYouNailed || latestAttempt.strengths;
+      const missing =
+        latestAttempt.missingToReview || latestAttempt.missingConcepts;
       setResponseText(latestAttempt.userResponseText);
       setEvaluation({
         masteryScore: latestAttempt.aiScore,
-        accuratePoints: latestAttempt.strengths,
-        missedOrInaccurateConcepts: latestAttempt.missingConcepts,
+        accuratePoints: nailed,
+        whatYouNailed: nailed,
+        cognitiveStageCheck: latestAttempt.cognitiveStageCheck || '',
+        missedOrInaccurateConcepts: missing,
+        missingToReview: missing,
         coachFeedback: latestAttempt.correctiveFeedback,
         socraticFollowUpQuestion: latestAttempt.followUpQuestion,
         recommendAdaptiveExtraSession: latestAttempt.aiScore < 70,
@@ -210,6 +224,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
           plan,
           session,
           userResponseText: combinedText,
+          user: currentUser,
         });
       setEvaluation(resultEval);
       setResponseText(combinedText);
@@ -233,6 +248,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
         session,
         missingConcepts: evaluation.missedOrInaccurateConcepts,
         followUpQuestion: evaluation.socraticFollowUpQuestion,
+        user: currentUser,
       });
       setBoosterCreatedSession(newSession);
       onPlanUpdated(updatedPlan);
@@ -245,9 +261,9 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
     .trim()
     .split(/\s+/)
     .filter(Boolean).length;
-  const isFeynmanStage =
-    session.stageName.toLowerCase().includes('feynman') ||
-    session.stageName.toLowerCase().includes('mastery verification');
+  const stageNumber = resolveStageNumber(session);
+  const stageMeta = STAGE_GUIDANCE_CONFIG[stageNumber];
+  const displayStageName = normalizeStageName(session.stageName);
 
   return (
     <div className="space-y-6">
@@ -303,7 +319,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
             <span>Scheduled: {session.scheduledDate}</span>
           </div>
           <h2 className="text-2xl font-bold text-slate-900 dark:text-white">
-            {session.stageName}
+            {displayStageName}
           </h2>
           <p className="text-sm text-slate-600 dark:text-slate-300">
             {session.cognitiveGoal}
@@ -316,16 +332,22 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
         <div className="lg:col-span-2 space-y-6">
           {/* Prompts Card */}
           <div className="rounded-2xl border border-emerald-500/30 bg-white dark:bg-slate-900/95 p-6 space-y-4 shadow-xs">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-bold uppercase tracking-wider text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
                 <Sparkles className="h-4 w-4" />
-                {isFeynmanStage
-                  ? 'Feynman Teach-Back Studio Challenge'
-                  : 'Assigned Closed-Book Active-Recall Prompts'}
+                {stageMeta.sectionHeader}
               </h3>
-              <span className="rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-                No Passive Re-Reading
+              <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                {stageMeta.badgeLabel}
               </span>
+            </div>
+
+            {/* Stage-Specific "What You Need to Produce" Guidance Banner */}
+            <div className="rounded-xl border border-teal-500/30 bg-teal-50/70 dark:bg-teal-950/25 px-4 py-3 text-xs text-teal-950 dark:text-teal-100 leading-relaxed">
+              <span className="font-bold uppercase tracking-wider text-teal-800 dark:text-teal-300 mr-1.5">
+                What You Need to Produce:
+              </span>
+              <span>{stageMeta.guidanceBanner}</span>
             </div>
 
             <ol className="space-y-3">
@@ -385,11 +407,7 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
                 rows={8}
                 value={responseText}
                 onChange={(e) => setResponseText(e.target.value)}
-                placeholder={
-                  isFeynmanStage
-                    ? 'Explain the core concepts from scratch in plain, vivid language as if teaching an intelligent beginner. Avoid hiding behind undefined jargon...'
-                    : 'Type or dictate everything you can retrieve from long-term memory for each prompt above before unlocking the source digest...'
-                }
+                placeholder={stageMeta.inputPlaceholder}
                 className="w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-4 text-sm text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 leading-relaxed focus:border-emerald-600 dark:focus:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
               />
 
@@ -506,38 +524,66 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
                 )}
               </div>
 
-              {/* Strengths & Missed Concepts Grid */}
+              {/* Cognitive Stage Check Callout */}
+              {evaluation.cognitiveStageCheck && (
+                <div className="rounded-xl border border-teal-500/35 bg-teal-50/70 dark:bg-teal-950/20 p-4 space-y-1">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-teal-800 dark:text-teal-300">
+                    Cognitive Stage Check (Stage {stageNumber})
+                  </h4>
+                  <p className="text-xs text-teal-950 dark:text-teal-100 leading-relaxed">
+                    {evaluation.cognitiveStageCheck}
+                  </p>
+                </div>
+              )}
+
+              {/* What You Nailed & Missing / To Review Grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="rounded-xl border border-emerald-500/30 bg-emerald-50/70 dark:bg-emerald-950/15 p-4 space-y-2">
                   <h4 className="text-xs font-bold uppercase tracking-wider text-emerald-800 dark:text-emerald-300 flex items-center gap-1.5">
                     <CheckCircle2 className="h-4 w-4" />
-                    Accurate Retrieval Points ({evaluation.accuratePoints.length})
+                    What You Nailed (
+                    {(evaluation.whatYouNailed || evaluation.accuratePoints).length}
+                    )
                   </h4>
                   <ul className="space-y-1.5 text-xs text-emerald-950 dark:text-emerald-100/90">
-                    {evaluation.accuratePoints.map((pt, i) => (
-                      <li key={i} className="flex items-start gap-2">
-                        <span className="text-emerald-600 dark:text-emerald-400 font-bold">
-                          ✓
-                        </span>
-                        <span>{pt}</span>
-                      </li>
-                    ))}
+                    {(evaluation.whatYouNailed || evaluation.accuratePoints).map(
+                      (pt, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                            ✓
+                          </span>
+                          <span>{pt}</span>
+                        </li>
+                      )
+                    )}
                   </ul>
                 </div>
 
                 <div className="rounded-xl border border-amber-500/30 bg-amber-50/70 dark:bg-amber-950/15 p-4 space-y-2">
                   <h4 className="text-xs font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
                     <AlertTriangle className="h-4 w-4" />
-                    Missed or Incomplete Concepts (
-                    {evaluation.missedOrInaccurateConcepts.length})
+                    Missing / To Review (
+                    {
+                      (
+                        evaluation.missingToReview ||
+                        evaluation.missedOrInaccurateConcepts
+                      ).length
+                    }
+                    )
                   </h4>
-                  {evaluation.missedOrInaccurateConcepts.length === 0 ? (
+                  {(
+                    evaluation.missingToReview ||
+                    evaluation.missedOrInaccurateConcepts
+                  ).length === 0 ? (
                     <p className="text-xs text-emerald-700 dark:text-emerald-300">
                       Zero critical omissions detected!
                     </p>
                   ) : (
                     <ul className="space-y-1.5 text-xs text-amber-950 dark:text-amber-100/90">
-                      {evaluation.missedOrInaccurateConcepts.map((miss, i) => (
+                      {(
+                        evaluation.missingToReview ||
+                        evaluation.missedOrInaccurateConcepts
+                      ).map((miss, i) => (
                         <li key={i} className="flex items-start gap-2">
                           <span className="text-amber-600 dark:text-amber-400 font-bold">
                             •
@@ -653,6 +699,36 @@ export const SessionWorkspace: React.FC<SessionWorkspaceProps> = ({
               </div>
             ) : (
               <div className="space-y-4">
+                {session.promptItems?.some(
+                  (item) => (item.expected_rubric_points?.length || 0) > 0
+                ) && (
+                  <div>
+                    <h4 className="text-xs font-semibold text-teal-700 dark:text-teal-300 mb-2">
+                      Stage Prompt Rubric Criteria:
+                    </h4>
+                    <div className="space-y-2">
+                      {session.promptItems.map((item, idx) =>
+                        item.expected_rubric_points &&
+                        item.expected_rubric_points.length > 0 ? (
+                          <div
+                            key={idx}
+                            className="rounded-lg border border-teal-200 dark:border-teal-900/50 bg-teal-50/50 dark:bg-teal-950/20 p-2.5 text-xs space-y-1"
+                          >
+                            <div className="font-semibold text-teal-900 dark:text-teal-200">
+                              Prompt #{idx + 1} Expected Elements:
+                            </div>
+                            <ul className="list-disc pl-4 space-y-0.5 text-slate-700 dark:text-slate-300">
+                              {item.expected_rubric_points.map((rp, rIdx) => (
+                                <li key={rIdx}>{rp}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 <div>
                   <h4 className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 mb-2">
                     Mastery Verification Checklist:
