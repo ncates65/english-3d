@@ -29,7 +29,7 @@ jobs:
         with:
           switches: -avz --delete --exclude='api' --exclude='.htaccess'
           path: study/dist/
-          remote_path: ${{ secrets.DEPLOY_PATH }}study/
+          remote_path: ${{ secrets.DEPLOY_PATH }}/study/
           remote_host: ${{ secrets.HOSTINGER_HOST }}
           remote_port: 65002
           remote_user: ${{ secrets.HOSTINGER_USER }}
@@ -40,7 +40,7 @@ jobs:
         with:
           switches: -avz --delete --exclude='config.php' --exclude='config.local.php' --exclude='.env'
           path: study/api/
-          remote_path: ${{ secrets.DEPLOY_PATH }}study/api/
+          remote_path: ${{ secrets.DEPLOY_PATH }}/study/api/
           remote_host: ${{ secrets.HOSTINGER_HOST }}
           remote_port: 65002
           remote_user: ${{ secrets.HOSTINGER_USER }}
