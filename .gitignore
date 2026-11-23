@@ -3,9 +3,11 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+*.tsbuildinfo
 
 # Secrets & Environment Configuration (PHP, OAuth, API Keys)
 config.php
+config.local.php
 .env
 .env.*
 !.env.example
