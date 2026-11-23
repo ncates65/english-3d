@@ -199,7 +199,7 @@ function callGeminiStructured(array $inputContentItems, array $jsonSchema, strin
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 90,
+        CURLOPT_TIMEOUT        => 45,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_HTTPHEADER     => [
             'Content-Type: application/json',
@@ -827,7 +827,7 @@ REQUIREMENTS FOR CANONICAL BLUEPRINT (CALL 1):
 4. `conceptClusters`: Group the domain into coherent teachable topic clusters (`cluster_id`, `title`, `key_concepts[]`), suitable for spiral chunking when broad.
 5. `relationships`: List specific causal, hierarchical, contrast, or dependency links across concepts.
 6. `misconceptionsOrTraps`: List common conceptual traps, look-alike confusions, or boundary failure cases learners stumble over.
-7. `extractedSourceDigest`: Write an exhaustive, authoritative 1,000 to 2,000 word structured reference digest capturing all key definitions, formulas, mechanisms, contrasts, and examples for closed-book AI grading later.
+7. `extractedSourceDigest`: Write an exhaustive, authoritative 400 to 600 word structured reference digest capturing all key definitions, formulas, mechanisms, contrasts, and examples for closed-book AI grading later.
 CALL1_INSTRUCTIONS;
 
     $call1InputItems = $inputItems;
@@ -955,7 +955,7 @@ CALL1_INSTRUCTIONS;
             'conceptClusters' => $conceptClusters,
             'relationships' => $blueprintData['relationships'] ?? [],
             'misconceptionsOrTraps' => $blueprintData['misconceptionsOrTraps'] ?? [],
-            'digestExcerpt' => mb_substr((string) ($blueprintData['extractedSourceDigest'] ?? ''), 0, 8000),
+            'digestExcerpt' => mb_substr((string) ($blueprintData['extractedSourceDigest'] ?? ''), 0, 3000),
         ];
 
         $skeletonPayload = [];
@@ -1004,7 +1004,7 @@ CRITICAL PROGRESSIVE SESSION GENERATION RULES:
 5. `continuityHook`:
    - For `sessionNumber === 1`: set `continuityHook` to empty string `""`.
    - For Sessions `2..N`: write exactly ONE crisp connecting sentence referencing the previous session's concepts or retrieval milestone (e.g., "Building on the Chunk A schema you mapped in Session #1, you now add Chunk B while stress-testing Chunk A from memory.").
-6. RUBRIC POINTS & CHECKLIST: Provide 2 to 4 prompts per session, each with 3 to 5 concrete `expected_rubric_points`, and 4 to 6 `verificationChecklist` criteria per session.
+6. RUBRIC POINTS & CHECKLIST: Provide 2 focused prompts per session, each with 2 to 3 concrete `expected_rubric_points`, and 4 to 6 `verificationChecklist` criteria per session.
 CALL2_INSTRUCTIONS;
 
         $sessionsSchema = [
