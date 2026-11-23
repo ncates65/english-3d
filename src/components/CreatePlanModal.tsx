@@ -86,6 +86,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
   const [isDragging, setIsDragging] = useState(false);
 
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generationStatus, setGenerationStatus] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Open/close native <dialog> via showModal() + modern-web-guidance light-dismiss fallback
@@ -214,6 +215,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
     }
 
     setIsGenerating(true);
+    setGenerationStatus('Step 1/2: Digesting materials with Gemini...');
     try {
       const normalizedStartHour = snapToFiveMinuteStep(startHour);
       const normalizedEndHour = snapToFiveMinuteStep(endHour);
@@ -233,6 +235,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
         scheduledBlueprints: spacingPreview.sessions,
         studyWindow,
         user: currentUser,
+        onProgress: (statusText) => setGenerationStatus(statusText),
       });
 
       onPlanCreated(plan, syncMode, persistedInMySql);
@@ -243,6 +246,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
       );
     } finally {
       setIsGenerating(false);
+      setGenerationStatus('');
     }
   };
 
@@ -317,15 +321,14 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
                 setIsDragging(false);
                 void handleFilesSelected(e.dataTransfer.files);
               }}
-              className={`flex flex-1 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-4 text-center transition ${
-                isDragging
+              className={`flex flex-1 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-4 text-center transition ${isDragging
                   ? 'border-emerald-500 bg-emerald-500/10'
                   : 'border-slate-300 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 hover:border-emerald-500/60 dark:hover:border-slate-600'
-              }`}
+                }`}
             >
               <Upload className="h-6 w-6 text-emerald-600 dark:text-emerald-400 mb-2" />
               <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
-                Drag &amp; drop files here, or{' '}
+                Drag & drop files here, or{' '}
                 <span className="text-emerald-600 dark:text-emerald-400 underline">
                   browse
                 </span>
@@ -613,7 +616,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
         <div>
           <span className="flex items-center gap-2.5 text-sm font-bold text-slate-900 dark:text-white mb-2.5">
             <StepBadge num={6} />
-            <span>Calendar &amp; Tasks Deep-Link Sync Mode</span>
+            <span>Calendar & Tasks Deep-Link Sync Mode</span>
           </span>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {[
@@ -639,11 +642,10 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
                   key={option.id}
                   type="button"
                   onClick={() => setSyncMode(option.id)}
-                  className={`flex flex-col items-start rounded-xl border p-3 text-left transition ${
-                    selected
+                  className={`flex flex-col items-start rounded-xl border p-3 text-left transition ${selected
                       ? 'border-emerald-600 dark:border-emerald-500 bg-emerald-500/10 dark:bg-emerald-500/15 text-slate-900 dark:text-white'
                       : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 text-slate-700 dark:text-slate-300 hover:border-slate-300 dark:hover:border-slate-700'
-                  }`}
+                    }`}
                 >
                   <div className="flex items-center justify-between w-full">
                     <span className="text-xs font-semibold">{option.title}</span>
@@ -684,7 +686,7 @@ export const CreatePlanModal: React.FC<CreatePlanModalProps> = ({
             {isGenerating ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Synthesizing Spaced Plan via Gemini 3.8 Flash...
+                {generationStatus || 'Synthesizing Spaced Plan via Gemini 3.8 Flash...'}
               </>
             ) : (
               <>

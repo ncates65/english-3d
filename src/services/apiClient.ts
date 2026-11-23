@@ -164,14 +164,14 @@ function normalizePlanData(plan: StudyPlan): StudyPlan {
       const promptItems: SessionPromptItem[] =
         Array.isArray(s.promptItems) && s.promptItems.length > 0
           ? s.promptItems.map((pi) => ({
-              prompt_text: pi.prompt_text,
-              expected_rubric_points: pi.expected_rubric_points || [],
-              ...(pi.chunk_tag ? { chunk_tag: pi.chunk_tag } : {}),
-            }))
+            prompt_text: pi.prompt_text,
+            expected_rubric_points: pi.expected_rubric_points || [],
+            ...(pi.chunk_tag ? { chunk_tag: pi.chunk_tag } : {}),
+          }))
           : (s.prompts || []).map((p) => ({
-              prompt_text: p,
-              expected_rubric_points: [],
-            }));
+            prompt_text: p,
+            expected_rubric_points: [],
+          }));
       return {
         ...s,
         stageNumber,
@@ -1004,84 +1004,103 @@ export async function generateAndSaveStudyPlan(params: {
   masterByDate: string;
   scheduledBlueprints: ScheduledSessionBlueprint[];
   studyWindow: StudyWindowConfig;
-  userEmail?: string;
   user?: UserAccount | null;
-}): Promise<{ plan: StudyPlan; persistedInMySql: boolean; warning?: string }> {
-  let candidatePlan: StudyPlan | null = null;
-  let persistedInMySql = false;
-  let warning: string | undefined;
-  const activeUser = params.user || getStoredUser();
+  onProgress?: (statusText: string) => void;
+}): Promise<{ plan: StudyPlan; persistedInMySql: boolean }> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...buildAuthHeaders(),
+  };
 
+  // --- Step 1/2: Harvest URLs/Files & Extract Knowledge Blueprint ---
+  params.onProgress?.('Step 1/2: Digesting materials with Gemini...');
+  const step1Res = await fetch(`${API_BASE}/gemini.php?action=extract_blueprint`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      action: 'extract_blueprint',
+      topicPrompt: params.topicPrompt,
+      urls: params.urls,
+      files: params.files,
+      startDate: params.startDate,
+      scheduledBlueprints: params.scheduledBlueprints,
+      studyWindowMinutes: params.studyWindow.durationMinutes,
+    }),
+  });
+
+  const step1Text = await step1Res.text();
+  let step1Data: Record<string, unknown> = {};
   try {
-    const res = await fetch(`${API_BASE}/gemini.php?action=generate_plan`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildAuthHeaders(),
-      },
-      body: JSON.stringify({
-        action: 'generate_plan',
-        topicPrompt: params.topicPrompt,
-        urls: params.urls,
-        files: params.files,
-        startDate: params.startDate,
-        masterByDate: params.masterByDate,
-        studyWindowMinutes: params.studyWindow.durationMinutes,
-        scheduledBlueprints: params.scheduledBlueprints,
-        userEmail: activeUser?.email || params.userEmail || 'learner@english-3d.com',
-        guestToken: getOrCreateLocalGuestToken(),
-        saveToDb: true,
-      }),
-    });
-
-    const contentType = res.headers.get('content-type') || '';
-    if (res.ok && contentType.includes('application/json')) {
-      const data = await res.json();
-      if (data.ok && data.plan) {
-        persistedInMySql = Boolean(
-          data.persistedInMySql && data.plan.id && !data.plan.dbWarning
-        );
-        if (data.aiWarning) {
-          warning = String(data.aiWarning);
-        } else if (data.plan.dbWarning) {
-          warning = String(data.plan.dbWarning);
-        }
-        candidatePlan = normalizePlanData({
-          ...data.plan,
-          id: data.plan.id || Date.now(),
-          createdAt: data.plan.createdAt || new Date().toISOString(),
-          studyWindow: params.studyWindow,
-        });
-      }
-    }
+    step1Data = JSON.parse(step1Text) as Record<string, unknown>;
   } catch {
-    // Fallback to client-side synthesized plan when PHP proxy is unreachable
+    throw new Error(
+      `Step 1 (material digestion) failed with HTTP ${step1Res.status}. The server timed out or returned non-JSON.`
+    );
   }
 
-  if (!candidatePlan) {
-    candidatePlan = buildSynthesizedPlanFallback({
-      ...params,
-      userEmail: activeUser?.email || params.userEmail,
-    });
+  if (!step1Res.ok || !step1Data.ok || !step1Data.blueprint) {
+    throw new Error(
+      String(step1Data.error || `Step 1 failed (HTTP ${step1Res.status}).`)
+    );
   }
 
-  if (!persistedInMySql) {
-    const persisted = await persistPlanDirectToMySql(candidatePlan, activeUser);
-    if (persisted) {
-      candidatePlan = persisted;
-      persistedInMySql = true;
-    } else {
-      warning =
-        warning ||
-        'Saved in browser cache only because Hostinger MySQL could not be reached.';
-    }
+  // --- Step 2/2: Generate Spaced Sessions & Persist to MySQL ---
+  params.onProgress?.('Step 2/2: Building spaced retrieval sessions...');
+  const step2Res = await fetch(`${API_BASE}/gemini.php?action=generate_sessions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      action: 'generate_sessions',
+      blueprint: step1Data.blueprint,
+      studyMode: step1Data.studyMode,
+      targetChunkCount: step1Data.targetChunkCount,
+      studyWindowMinutes: step1Data.studyWindowMinutes,
+      harvestedLinks: step1Data.harvestedLinks,
+      scheduledBlueprints: params.scheduledBlueprints,
+      startDate: params.startDate,
+      masterByDate: params.masterByDate,
+      userEmail: params.user?.email || 'learner@english-3d.com',
+      saveToDb: true,
+    }),
+  });
+
+  const step2Text = await step2Res.text();
+  let step2Data: Record<string, unknown> = {};
+  try {
+    step2Data = JSON.parse(step2Text) as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      `Step 2 (session generation) failed with HTTP ${step2Res.status}. The server timed out or returned non-JSON.`
+    );
   }
 
-  const scopeKey = getPlansStorageKey(activeUser);
-  markSeedInitialized(scopeKey);
-  const current = loadLocalPlans(activeUser).filter((p) => p.id !== candidatePlan!.id);
-  saveLocalPlans([candidatePlan, ...current], activeUser);
-  return { plan: candidatePlan, persistedInMySql, warning };
+  if (!step2Res.ok || !step2Data.ok || !step2Data.plan) {
+    throw new Error(
+      String(step2Data.error || `Step 2 failed (HTTP ${step2Res.status}).`)
+    );
+  }
+
+  const normalizedPlan = normalizePlanData({
+    ...(step2Data.plan as StudyPlan),
+    studyWindow: params.studyWindow,
+  });
+  const persistedInMySql = Boolean(step2Data.persistedInMySql);
+
+  // Keep local browser cache in sync
+  try {
+    const key = getPlansStorageKey(params.user);
+    const existingRaw = localStorage.getItem(key);
+    const existing: StudyPlan[] = existingRaw ? JSON.parse(existingRaw) : [];
+    const updated = [
+      normalizedPlan,
+      ...existing.filter((p) => p.id !== normalizedPlan.id),
+    ];
+    localStorage.setItem(key, JSON.stringify(updated));
+  } catch {
+    // Ignore storage quota errors
+  }
+
+  return { plan: normalizedPlan, persistedInMySql };
 }
 
 function mergeUniquePromptItemsLocal(
@@ -1187,7 +1206,7 @@ function applyLocalThreeTierRecalibration(
         mergedIds.add(src.id);
         combinedPrompts = mergeUniquePromptItemsLocal(
           src.promptItems ||
-            src.prompts.map((p) => ({ prompt_text: p, expected_rubric_points: [] })),
+          src.prompts.map((p) => ({ prompt_text: p, expected_rubric_points: [] })),
           combinedPrompts
         );
         combinedChecklist = mergeUniqueChecklistLocal(

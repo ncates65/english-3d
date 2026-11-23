@@ -696,7 +696,511 @@ if ($action === 'harvest_url') {
     $harvested = harvestUrlContent($url);
     respondJson($harvested);
 }
+// =============================================================================
+// Action B1: extract_blueprint — Call 1 (Harvest URLs/Files + Knowledge Blueprint)
+// =============================================================================
+if ($action === 'extract_blueprint') {
+    $topicPrompt = trim((string) ($body['topicPrompt'] ?? ''));
+    $urls = is_array($body['urls'] ?? null) ? $body['urls'] : [];
+    $files = is_array($body['files'] ?? null) ? $body['files'] : [];
+    $scheduledBlueprints = is_array($body['scheduledBlueprints'] ?? null) ? $body['scheduledBlueprints'] : [];
+    $startDate = (string) ($body['startDate'] ?? date('Y-m-d'));
+    $studyWindowMinutes = max(
+        10,
+        min(240, (int) ($body['studyWindowMinutes'] ?? ($body['studyWindow']['durationMinutes'] ?? 30)))
+    );
 
+    if ($topicPrompt === '' && empty($urls) && empty($files)) {
+        respondJson([
+            'ok' => false,
+            'error' => 'Please provide a study topic, at least one study file, or a source URL.',
+        ], 400);
+    }
+
+    $sessionCount = max(1, count($scheduledBlueprints));
+
+    // 1. Harvest URLs
+    $harvestedLinks = [];
+    $harvestedContextBlocks = [];
+    foreach ($urls as $rawUrl) {
+        $u = trim((string) $rawUrl);
+        if ($u === '') continue;
+        $info = harvestUrlContent($u);
+        $harvestedLinks[] = [
+            'url' => $u,
+            'title' => $info['title'],
+            'status' => $info['ok'] ? 'harvested' : 'unreachable',
+        ];
+        if ($info['ok']) {
+            $harvestedContextBlocks[] = "=== SOURCE URL: {$u} ({$info['title']}) ===\n{$info['text']}";
+        }
+    }
+
+    // 2. Build Multimodal Input Array
+    $inputItems = [];
+    $inlineFileTextBlocks = [];
+    foreach ($files as $file) {
+        $fileName = (string) ($file['name'] ?? 'uploaded-file');
+        $mimeType = strtolower(trim((string) ($file['mimeType'] ?? 'application/octet-stream')));
+        $base64Data = (string) ($file['base64Data'] ?? '');
+
+        if (str_contains($base64Data, ',')) {
+            $base64Data = explode(',', $base64Data, 2)[1];
+        }
+        if ($base64Data === '') continue;
+
+        if ($mimeType === 'application/pdf') {
+            $inputItems[] = [
+                'type' => 'document',
+                'data' => $base64Data,
+                'mime_type' => 'application/pdf',
+            ];
+        } elseif (str_starts_with($mimeType, 'image/')) {
+            $inputItems[] = [
+                'type' => 'image',
+                'data' => $base64Data,
+                'mime_type' => $mimeType,
+            ];
+        } elseif (str_contains($mimeType, 'wordprocessingml') || str_ends_with(strtolower($fileName), '.docx')) {
+            $docxText = extractDocxTextFromBase64($base64Data);
+            if ($docxText !== '') {
+                $inlineFileTextBlocks[] = "=== UPLOADED DOCX ({$fileName}) ===\n{$docxText}";
+            }
+        } else {
+            $decodedText = base64_decode($base64Data, true);
+            if ($decodedText !== false) {
+                $inlineFileTextBlocks[] = "=== UPLOADED FILE ({$fileName}) ===\n" . mb_substr($decodedText, 0, 25000);
+            }
+        }
+    }
+
+    $combinedText = trim(
+        $topicPrompt . "\n" . implode("\n", $inlineFileTextBlocks) . "\n" . implode("\n", $harvestedContextBlocks)
+    );
+    $wordParts = preg_split('/\s+/u', $combinedText) ?: [];
+    $wordCount = count(array_filter($wordParts, static fn($w) => $w !== ''));
+
+    // 3. Call 1: Canonical Knowledge Blueprint (trimmed for fast response)
+    $call1Prompt = "Analyze the learner's topic, study objectives, attached multimodal files, and harvested URLs to extract a structured Canonical Knowledge Blueprint.\n\n"
+        . "USER STUDY TOPIC / LEARNING OBJECTIVES:\n"
+        . ($topicPrompt !== '' ? $topicPrompt : 'Derive comprehensive learning objectives directly from the attached files and URLs.') . "\n\n";
+
+    if (!empty($inlineFileTextBlocks)) {
+        $call1Prompt .= "EXTRACTED TEXT FROM UPLOADED FILES:\n" . implode("\n\n", $inlineFileTextBlocks) . "\n\n";
+    }
+    if (!empty($harvestedContextBlocks)) {
+        $call1Prompt .= "HARVESTED WEB SOURCE CONTENT:\n" . implode("\n\n", $harvestedContextBlocks) . "\n\n";
+    }
+
+    $call1Prompt .= <<<'CALL1_INSTRUCTIONS'
+REQUIREMENTS FOR CANONICAL BLUEPRINT (CALL 1):
+1. `estimatedFirstPassMinutes`: Estimate realistically how many minutes a focused learner needs to absorb and map the FULL source material on a first pass (integer).
+2. `learningObjectives`: Return 3 to 5 concrete, measurable mastery objectives.
+3. `coreConcepts`: Return 3 to 5 macro conceptual pillars (`id`, `title`, `summary`, `connections`) showing how the system fits together.
+4. `conceptClusters`: Group the domain into coherent teachable topic clusters (`cluster_id`, `title`, `key_concepts[]`), suitable for spiral chunking when broad.
+5. `relationships`: List specific causal, hierarchical, contrast, or dependency links across concepts.
+6. `misconceptionsOrTraps`: List common conceptual traps, look-alike confusions, or boundary failure cases learners stumble over.
+7. `extractedSourceDigest`: Write a concise, authoritative 400 to 600 word structured reference digest capturing all key definitions, mechanisms, contrasts, and examples for closed-book AI grading later.
+CALL1_INSTRUCTIONS;
+
+    $call1InputItems = $inputItems;
+    $call1InputItems[] = ['type' => 'text', 'text' => $call1Prompt];
+
+    $blueprintSchema = [
+        'type' => 'object',
+        'properties' => [
+            'topicTitle' => ['type' => 'string'],
+            'executiveSummary' => ['type' => 'string'],
+            'estimatedFirstPassMinutes' => ['type' => 'integer'],
+            'learningObjectives' => ['type' => 'array', 'items' => ['type' => 'string']],
+            'coreConcepts' => [
+                'type' => 'array',
+                'items' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'id' => ['type' => 'string'],
+                        'title' => ['type' => 'string'],
+                        'summary' => ['type' => 'string'],
+                        'connections' => ['type' => 'string'],
+                    ],
+                    'required' => ['id', 'title', 'summary', 'connections'],
+                ],
+            ],
+            'conceptClusters' => [
+                'type' => 'array',
+                'items' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'cluster_id' => ['type' => 'string'],
+                        'title' => ['type' => 'string'],
+                        'key_concepts' => ['type' => 'array', 'items' => ['type' => 'string']],
+                    ],
+                    'required' => ['cluster_id', 'title', 'key_concepts'],
+                ],
+            ],
+            'relationships' => ['type' => 'array', 'items' => ['type' => 'string']],
+            'misconceptionsOrTraps' => ['type' => 'array', 'items' => ['type' => 'string']],
+            'extractedSourceDigest' => ['type' => 'string'],
+        ],
+        'required' => [
+            'topicTitle',
+            'executiveSummary',
+            'estimatedFirstPassMinutes',
+            'learningObjectives',
+            'coreConcepts',
+            'conceptClusters',
+            'relationships',
+            'misconceptionsOrTraps',
+            'extractedSourceDigest',
+        ],
+    ];
+
+    $blueprintSystem = 'You are Practice Buddy, an expert cognitive scientist and curriculum architect. Extract a precise, factual Canonical Knowledge Blueprint strictly matching the lowercase JSON schema.';
+    $call1Result = callGeminiStructured($call1InputItems, $blueprintSchema, $blueprintSystem);
+
+    if (!$call1Result['ok'] || !is_array($call1Result['data'])) {
+        respondJson([
+            'ok' => false,
+            'step' => 'extract_blueprint',
+            'error' => $call1Result['error'] ?? 'Gemini Call 1 (blueprint digestion) failed.',
+        ], 502);
+    }
+
+    $blueprintData = $call1Result['data'];
+    $estimatedMinutes = max(5, (int) ($blueprintData['estimatedFirstPassMinutes'] ?? 45));
+    $conceptClusters = is_array($blueprintData['conceptClusters'] ?? null) ? $blueprintData['conceptClusters'] : [];
+
+    $routing = selectStudyMode(
+        $sessionCount,
+        $studyWindowMinutes,
+        $wordCount,
+        $conceptClusters,
+        $estimatedMinutes
+    );
+
+    respondJson([
+        'ok' => true,
+        'modelUsed' => GEMINI_MODEL,
+        'blueprint' => $blueprintData,
+        'studyMode' => $routing['mode'],
+        'targetChunkCount' => $routing['target_chunk_count'],
+        'studyWindowMinutes' => $studyWindowMinutes,
+        'wordCount' => $wordCount,
+        'harvestedLinks' => $harvestedLinks,
+    ]);
+}
+
+// =============================================================================
+// Action B2: generate_sessions — Call 2 (Generate Sessions + Save Plan to MySQL)
+// =============================================================================
+if ($action === 'generate_sessions') {
+    $blueprintData = is_array($body['blueprint'] ?? null) ? $body['blueprint'] : null;
+    $scheduledBlueprints = is_array($body['scheduledBlueprints'] ?? null) ? $body['scheduledBlueprints'] : [];
+    $startDate = (string) ($body['startDate'] ?? date('Y-m-d'));
+    $masterByDate = (string) ($body['masterByDate'] ?? date('Y-m-d', strtotime('+14 days')));
+    $studyMode = ((string) ($body['studyMode'] ?? 'deepening')) === 'spiral_chunking' ? 'spiral_chunking' : 'deepening';
+    $targetChunkCount = max(1, min(10, (int) ($body['targetChunkCount'] ?? 1)));
+    $studyWindowMinutes = max(10, min(240, (int) ($body['studyWindowMinutes'] ?? 30)));
+    $harvestedLinks = is_array($body['harvestedLinks'] ?? null) ? $body['harvestedLinks'] : [];
+    $userEmail = trim((string) ($body['userEmail'] ?? 'learner@english-3d.com'));
+    $saveToDb = (bool) ($body['saveToDb'] ?? true);
+
+    if ($blueprintData === null || empty($scheduledBlueprints)) {
+        respondJson([
+            'ok' => false,
+            'error' => 'blueprint and scheduledBlueprints are required for generate_sessions.',
+        ], 400);
+    }
+
+    $sessionCount = count($scheduledBlueprints);
+    $stageSkeleton = buildStageSkeleton($sessionCount);
+    $conceptClusters = is_array($blueprintData['conceptClusters'] ?? null) ? $blueprintData['conceptClusters'] : [];
+    $chunkScopes = assignSpiralChunkScopes($sessionCount, $studyMode, $targetChunkCount);
+    $chunkModules = buildChunkModulesFromClusters($conceptClusters, $targetChunkCount);
+
+    $call2Blueprint = [
+        'topicTitle' => $blueprintData['topicTitle'] ?? 'Spaced Study Plan',
+        'executiveSummary' => $blueprintData['executiveSummary'] ?? '',
+        'learningObjectives' => $blueprintData['learningObjectives'] ?? [],
+        'coreConcepts' => $blueprintData['coreConcepts'] ?? [],
+        'conceptClusters' => $conceptClusters,
+        'relationships' => $blueprintData['relationships'] ?? [],
+        'misconceptionsOrTraps' => $blueprintData['misconceptionsOrTraps'] ?? [],
+        'digestExcerpt' => mb_substr((string) ($blueprintData['extractedSourceDigest'] ?? ''), 0, 3000),
+    ];
+
+    $skeletonPayload = [];
+    foreach ($scheduledBlueprints as $idx => $bp) {
+        $num = (int) ($bp['sessionNumber'] ?? ($idx + 1));
+        $skel = $stageSkeleton[$idx] ?? $stageSkeleton[count($stageSkeleton) - 1];
+        $skeletonPayload[] = [
+            'sessionNumber' => $num,
+            'scheduledDate' => (string) ($bp['scheduledDate'] ?? $startDate),
+            'dayOffset' => (int) ($bp['dayOffset'] ?? 0),
+            'gapDays' => (int) ($bp['gapDays'] ?? 0),
+            'stageNumber' => $skel['stage_number'],
+            'stageKey' => $skel['stage_key'],
+            'stageName' => $skel['stage_name'],
+            'subAngle' => $skel['sub_angle'],
+            'defaultCognitiveGoal' => $skel['cognitive_goal'],
+            'chunkScope' => $chunkScopes[$idx] ?? null,
+        ];
+    }
+
+    $call2Prompt = "CANONICAL KNOWLEDGE BLUEPRINT:\n"
+        . json_encode($call2Blueprint, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n"
+        . "ROUTED STUDY MODE: {$studyMode} (targetChunkCount={$targetChunkCount}, studyWindowMinutes={$studyWindowMinutes})\n"
+        . (!empty($chunkModules)
+            ? "SPIRAL CHUNK MODULES:\n" . json_encode($chunkModules, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n"
+            : '')
+        . "ASSIGNED SESSION SKELETON & CEPEDA SCHEDULE:\n"
+        . json_encode($skeletonPayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n"
+        . <<<'CALL2_INSTRUCTIONS'
+CRITICAL PROGRESSIVE SESSION GENERATION RULES:
+1. STRICT SKELETON ALIGNMENT: Emit one object in `sessions[]` for EVERY item in the ASSIGNED SESSION SKELETON matching its exact `sessionNumber`, `stageNumber`, `stageKey`, and `stageName`.
+2. BLUEPRINT BINDING: Bind every prompt directly to specific concepts, clusters, `relationships`, or `misconceptionsOrTraps` from the Canonical Knowledge Blueprint above—never write generic filler questions.
+3. FORBID PASSIVE RE-READING: Require effortful closed-book recall, causal interrogation, scenario transfer, or Feynman teach-back tailored to each session's `stageNumber` and `subAngle`.
+4. `chunk_tag`: Use `"Full Topic"` in `deepening` mode or final synthesis; in `spiral_chunking`, use `"New: Chunk X"` or `"Review: Chunk Y"` matching `chunkScope`.
+5. `continuityHook`: Empty string `""` for Session 1; for Sessions 2..N, write one crisp connecting sentence referencing the prior session.
+6. CONCISE RUBRICS: Provide 2 focused prompts per session, each with 2 to 3 concrete `expected_rubric_points`, and 3 to 4 `verificationChecklist` criteria per session.
+CALL2_INSTRUCTIONS;
+
+    $sessionsSchema = [
+        'type' => 'object',
+        'properties' => [
+            'sessions' => [
+                'type' => 'array',
+                'items' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'sessionNumber' => ['type' => 'integer'],
+                        'stageNumber' => ['type' => 'integer'],
+                        'stageName' => ['type' => 'string'],
+                        'stageKey' => ['type' => 'string'],
+                        'cognitiveGoal' => ['type' => 'string'],
+                        'continuityHook' => ['type' => 'string'],
+                        'prompts' => [
+                            'type' => 'array',
+                            'items' => [
+                                'type' => 'object',
+                                'properties' => [
+                                    'prompt_text' => ['type' => 'string'],
+                                    'chunk_tag' => ['type' => 'string'],
+                                    'expected_rubric_points' => ['type' => 'array', 'items' => ['type' => 'string']],
+                                ],
+                                'required' => ['prompt_text', 'chunk_tag', 'expected_rubric_points'],
+                            ],
+                        ],
+                        'verificationChecklist' => ['type' => 'array', 'items' => ['type' => 'string']],
+                    ],
+                    'required' => [
+                        'sessionNumber',
+                        'stageNumber',
+                        'stageName',
+                        'stageKey',
+                        'cognitiveGoal',
+                        'continuityHook',
+                        'prompts',
+                        'verificationChecklist',
+                    ],
+                ],
+            ],
+        ],
+        'required' => ['sessions'],
+    ];
+
+    $sessionSystem = 'You are Practice Buddy, an expert cognitive-science retrieval coach. Produce progressive, blueprint-grounded spaced sessions strictly matching the lowercase JSON schema.';
+    $call2Result = callGeminiStructured(
+        [['type' => 'text', 'text' => $call2Prompt]],
+        $sessionsSchema,
+        $sessionSystem
+    );
+
+    if (!$call2Result['ok'] || !is_array($call2Result['data']) || empty($call2Result['data']['sessions'])) {
+        respondJson([
+            'ok' => false,
+            'step' => 'generate_sessions',
+            'error' => $call2Result['error'] ?? 'Gemini Call 2 (session prompt generation) failed.',
+        ], 502);
+    }
+
+    // Merge generated session prompts with deterministic skeleton & exact Cepeda dates
+    $mergedSessions = [];
+    $genSessionsByNum = [];
+    foreach ($call2Result['data']['sessions'] as $gs) {
+        $genSessionsByNum[(int) ($gs['sessionNumber'] ?? 0)] = $gs;
+    }
+
+    foreach ($scheduledBlueprints as $idx => $bp) {
+        $num = (int) ($bp['sessionNumber'] ?? ($idx + 1));
+        $gs = $genSessionsByNum[$num] ?? ($call2Result['data']['sessions'][$idx] ?? []);
+        $skel = $stageSkeleton[$idx] ?? $stageSkeleton[count($stageSkeleton) - 1];
+        $scope = $chunkScopes[$idx] ?? null;
+
+        $stageNumber = (int) $skel['stage_number'];
+        $stageKey = (string) ($skel['stage_key'] ?: ($gs['stageKey'] ?? 'schema_mapping'));
+        $rawStageName = normalizeGeminiStageName((string) ($skel['stage_name'] ?: ($gs['stageName'] ?? "Session {$num}")));
+
+        $unpacked = normalizeSessionPromptItems($gs['prompts'] ?? []);
+        $defaultTag = 'Full Topic';
+        if ($studyMode === 'spiral_chunking' && is_array($scope)) {
+            if (!empty($scope['new'])) {
+                $defaultTag = 'New: Chunk ' . (string) $scope['new'][0];
+            } elseif (!empty($scope['review']) && $scope['review'][0] !== 'ALL') {
+                $defaultTag = 'Review: Chunk ' . (string) $scope['review'][0];
+            }
+        }
+        foreach ($unpacked['promptItems'] as $pIdx => $pItem) {
+            if (empty($pItem['chunk_tag'])) {
+                $unpacked['promptItems'][$pIdx]['chunk_tag'] = $defaultTag;
+            }
+        }
+
+        $checklist = is_array($gs['verificationChecklist'] ?? null)
+            ? array_values(array_map('strval', $gs['verificationChecklist']))
+            : [];
+        if (empty($checklist) && !empty($unpacked['promptItems'])) {
+            foreach ($unpacked['promptItems'] as $pi) {
+                foreach ($pi['expected_rubric_points'] as $rp) {
+                    $checklist[] = $rp;
+                }
+            }
+            $checklist = array_slice(array_values(array_unique($checklist)), 0, 6);
+        }
+
+        $schedDate = (string) ($bp['scheduledDate'] ?? $startDate);
+        $continuityHook = $idx === 0
+            ? ''
+            : trim((string) ($gs['continuityHook'] ?? "Building on your Session #{$idx} recall, advance into {$rawStageName}."));
+
+        $mergedSessions[] = [
+            'sessionNumber' => $num,
+            'stageNumber' => $stageNumber,
+            'stageName' => mb_substr($rawStageName, 0, 160),
+            'stageKey' => mb_substr($stageKey, 0, 64),
+            'scheduledDate' => $schedDate,
+            'originalScheduledDate' => $schedDate,
+            'dayOffset' => (int) ($bp['dayOffset'] ?? 0),
+            'gapDays' => (int) ($bp['gapDays'] ?? 0),
+            'cognitiveGoal' => trim((string) ($gs['cognitiveGoal'] ?? $skel['cognitive_goal'] ?? ($bp['cognitiveGoal'] ?? ''))),
+            'chunkScope' => $scope,
+            'continuityHook' => $continuityHook,
+            'prompts' => $unpacked['prompts'],
+            'promptItems' => $unpacked['promptItems'],
+            'verificationChecklist' => $checklist,
+            'status' => 'pending',
+            'mergedIntoSessionId' => null,
+            'recalibrationCount' => 0,
+            'masteryScore' => null,
+            'calendarEventId' => null,
+            'completedAt' => null,
+            'attempts' => [],
+        ];
+    }
+
+    $resultPlan = [
+        'userEmail' => $userEmail,
+        'topicTitle' => mb_substr((string) ($blueprintData['topicTitle'] ?? 'Spaced Study Plan'), 0, 255),
+        'studyMode' => $studyMode,
+        'targetChunkCount' => $targetChunkCount,
+        'studyWindowMinutes' => $studyWindowMinutes,
+        'executiveSummary' => (string) ($blueprintData['executiveSummary'] ?? ''),
+        'coreConcepts' => is_array($blueprintData['coreConcepts'] ?? null) ? $blueprintData['coreConcepts'] : [],
+        'blueprint' => $blueprintData,
+        'sourceLinks' => $harvestedLinks,
+        'extractedContextCache' => (string) ($blueprintData['extractedSourceDigest'] ?? ''),
+        'startDate' => $startDate,
+        'masterByDate' => $masterByDate,
+        'sessions' => $mergedSessions,
+    ];
+
+    $persistedInMySql = false;
+    if ($saveToDb) {
+        try {
+            $pdo = getDbConnection();
+            $currentUser = resolveEffectiveUserRow($pdo, $body);
+            $currentUserId = (int) $currentUser['id'];
+            $effectiveEmail = trim((string) ($currentUser['email'] ?: $resultPlan['userEmail']));
+
+            $pdo->beginTransaction();
+
+            $planStmt = $pdo->prepare(
+                'INSERT INTO study_plans
+                (user_id, user_email, topic_title, study_mode, target_chunk_count, study_window_minutes, executive_summary, core_concepts_json, blueprint_json, source_links_json, extracted_context_cache, start_date, master_by_date)
+                VALUES (:user_id, :user_email, :topic_title, :study_mode, :target_chunk_count, :study_window_minutes, :executive_summary, :core_concepts_json, :blueprint_json, :source_links_json, :extracted_context_cache, :start_date, :master_by_date)'
+            );
+            $planStmt->execute([
+                ':user_id' => $currentUserId,
+                ':user_email' => mb_substr($effectiveEmail, 0, 255),
+                ':topic_title' => $resultPlan['topicTitle'],
+                ':study_mode' => $resultPlan['studyMode'],
+                ':target_chunk_count' => $resultPlan['targetChunkCount'],
+                ':study_window_minutes' => $resultPlan['studyWindowMinutes'],
+                ':executive_summary' => $resultPlan['executiveSummary'],
+                ':core_concepts_json' => json_encode($resultPlan['coreConcepts'], JSON_UNESCAPED_UNICODE),
+                ':blueprint_json' => json_encode($resultPlan['blueprint'], JSON_UNESCAPED_UNICODE),
+                ':source_links_json' => json_encode($resultPlan['sourceLinks'], JSON_UNESCAPED_UNICODE),
+                ':extracted_context_cache' => $resultPlan['extractedContextCache'],
+                ':start_date' => $resultPlan['startDate'],
+                ':master_by_date' => $resultPlan['masterByDate'],
+            ]);
+
+            $planId = (int) $pdo->lastInsertId();
+            $resultPlan['id'] = $planId;
+            $resultPlan['userId'] = $currentUserId;
+            $resultPlan['userEmail'] = $effectiveEmail;
+            $resultPlan['createdAt'] = date('Y-m-d H:i:s');
+
+            $sessionStmt = $pdo->prepare(
+                'INSERT INTO study_sessions
+                (plan_id, user_id, session_number, stage_number, stage_name, stage_key, scheduled_date, original_scheduled_date, day_offset, gap_days, cognitive_goal, chunk_scope_json, continuity_hook, prompts_json, verification_checklist_json, status, recalibration_count)
+                VALUES (:plan_id, :user_id, :session_number, :stage_number, :stage_name, :stage_key, :scheduled_date, :original_scheduled_date, :day_offset, :gap_days, :cognitive_goal, :chunk_scope_json, :continuity_hook, :prompts_json, :verification_checklist_json, :status, :recalibration_count)'
+            );
+
+            foreach ($resultPlan['sessions'] as $i => $sess) {
+                $promptsToStore = !empty($sess['promptItems']) ? $sess['promptItems'] : $sess['prompts'];
+                $sessionStmt->execute([
+                    ':plan_id' => $planId,
+                    ':user_id' => $currentUserId,
+                    ':session_number' => $sess['sessionNumber'],
+                    ':stage_number' => $sess['stageNumber'],
+                    ':stage_name' => $sess['stageName'],
+                    ':stage_key' => $sess['stageKey'],
+                    ':scheduled_date' => $sess['scheduledDate'],
+                    ':original_scheduled_date' => $sess['originalScheduledDate'],
+                    ':day_offset' => $sess['dayOffset'],
+                    ':gap_days' => $sess['gapDays'],
+                    ':cognitive_goal' => $sess['cognitiveGoal'],
+                    ':chunk_scope_json' => $sess['chunkScope'] !== null ? json_encode($sess['chunkScope'], JSON_UNESCAPED_UNICODE) : null,
+                    ':continuity_hook' => $sess['continuityHook'],
+                    ':prompts_json' => json_encode($promptsToStore, JSON_UNESCAPED_UNICODE),
+                    ':verification_checklist_json' => json_encode($sess['verificationChecklist'], JSON_UNESCAPED_UNICODE),
+                    ':status' => 'pending',
+                    ':recalibration_count' => 0,
+                ]);
+                $resultPlan['sessions'][$i]['id'] = (int) $pdo->lastInsertId();
+                $resultPlan['sessions'][$i]['planId'] = $planId;
+                $resultPlan['sessions'][$i]['userId'] = $currentUserId;
+            }
+
+            $pdo->commit();
+            $persistedInMySql = true;
+        } catch (Throwable $dbErr) {
+            if (isset($pdo) && $pdo instanceof PDO && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $resultPlan['dbWarning'] = 'Generated plan successfully, but MySQL persistence failed: ' . $dbErr->getMessage();
+        }
+    }
+
+    respondJson([
+        'ok' => true,
+        'modelUsed' => GEMINI_MODEL,
+        'persistedInMySql' => $persistedInMySql,
+        'aiWarning' => null,
+        'plan' => $resultPlan,
+    ]);
+}
 // =============================================================================
 // Action B: generate_plan / generate_session_prompts (Two-Step Gemini Pipeline)
 // =============================================================================
