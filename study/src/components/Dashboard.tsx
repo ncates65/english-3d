@@ -1240,8 +1240,21 @@ export const Dashboard: React.FC<DashboardProps> = ({
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-slate-200 dark:border-slate-800/80 bg-white/60 dark:bg-slate-950/60 py-4 text-center text-xs text-slate-500 dark:text-slate-400">
-        Practice Buddy — Evidence-Based Spaced Retrieval &amp; Feynman Teach-Back Studio
+      <footer className="border-t border-slate-200 dark:border-slate-800/80 bg-white/60 dark:bg-slate-950/60 px-4 py-4 text-center text-xs text-slate-500 dark:text-slate-400 space-y-1">
+        <div>
+          Practice Buddy — Evidence-Based Spaced Retrieval &amp; Feynman Teach-Back Studio
+        </div>
+        <div>
+          <a
+            href="https://nicholascates.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline decoration-slate-400/60 underline-offset-2 hover:text-slate-700 dark:hover:text-slate-200 transition"
+          >
+            Nicholas Cates
+          </a>{' '}
+          &copy;{new Date().getFullYear()}
+        </div>
       </footer>
 
       {/* Create Plan Modal */}
